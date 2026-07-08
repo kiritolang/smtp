@@ -1,0 +1,241 @@
+# SmtpServer — a receiving SMTP/ESMTP server framework in pure Kirito. Speaks the protocol (EHLO/HELO,
+# MAIL/RCPT, DATA + BDAT/CHUNKING, RSET/NOOP/VRFY/QUIT, optional AUTH), un-dot-stuffs DATA, and hands
+# each accepted message to an on_message(sender, recipients, data) callback. Single connection at a
+# time by default (serve_once for one, serve_forever for a loop); this is complete on the protocol,
+# and higher throughput can be layered with the `parallel` module and a file-defined handler.
+#
+# NOTE: the interpreter's socket TLS is client-side only, so a Kirito SMTP server is PLAINTEXT — it
+# advertises no STARTTLS and answers a STARTTLS command with 454. Put it behind stunnel for SMTPS.
+
+var net = import("net")
+var tport = import("smtp.transport")
+var auth = import("smtp.auth")
+var base64 = import("base64")
+var time = import("time")
+
+var _extract_addr = Function(line):
+    var lt = line.find("<")
+    var gt = line.find(">")
+    if lt >= 0 and gt > lt:
+        return line[lt + 1:gt]
+    var colon = line.find(":")
+    if colon >= 0:
+        return line[colon + 1:].strip().split(" ")[0]
+    return ""
+
+class SmtpServer:
+    # on_message(sender, recipients, data) -> Bool (True to accept/queue). auth_lookup(username) ->
+    # password (or None) enables AUTH PLAIN/LOGIN/CRAM-MD5. hostname is the greeting/EHLO name.
+    var _init_ = Function(self, host = "127.0.0.1", port = 25, on_message = None, auth_lookup = None, hostname = "smtp.local", max_size = 10485760, require_auth = False):
+        self.host = host
+        self.port = port
+        self.on_message = on_message
+        self.auth_lookup = auth_lookup
+        self.hostname = hostname
+        self.max_size = max_size
+        self.require_auth = require_auth
+        self._sock = None
+        self.messages = []          # every accepted message (for tests / simple stores)
+
+    # Bind + listen; returns the actual bound port (useful with port=0 for an ephemeral port).
+    var bind = Function(self):
+        var s = net.Socket()
+        s.setreuseaddr(True)
+        s.bind(self.host, self.port)
+        s.listen(16)
+        self._sock = s
+        self.port = s.getsockname()[1]
+        return self.port
+
+    var _send = Function(self, conn, s):
+        conn.send(s)
+
+    var _caps = Function(self):
+        var caps = [
+            "250-" + self.hostname,
+            "250-SIZE " + String(self.max_size),
+            "250-8BITMIME",
+            "250-SMTPUTF8",
+            "250-ENHANCEDSTATUSCODES",
+            "250-PIPELINING",
+            "250-CHUNKING"
+        ]
+        if self.auth_lookup != None:
+            caps.append("250-AUTH PLAIN LOGIN CRAM-MD5")
+        caps.append("250 HELP")
+        return "\r\n".join(caps) + "\r\n"
+
+    var _read_data = Function(self, reader):
+        var lines = []
+        while True:
+            var line = reader.read_line()
+            if line == None:
+                return None
+            if line == ".":
+                break
+            if line[0:1] == ".":
+                line = line[1:]
+            lines.append(line)
+        return "\r\n".join(lines) + "\r\n"
+
+    var _server_auth = Function(self, conn, reader, mech, parts):
+        if self.auth_lookup == None:
+            self._send(conn, "503 5.5.1 AUTH not available\r\n")
+            return None
+        var user = None
+        if mech == "PLAIN":
+            var ir = None
+            if len(parts) >= 3:
+                ir = parts[2]
+            else:
+                self._send(conn, "334 \r\n")
+                ir = reader.read_line()
+            if ir != None:
+                user = auth.verify_plain(ir, self.auth_lookup)
+        elif mech == "LOGIN":
+            self._send(conn, "334 " + base64.encode("Username:") + "\r\n")
+            var u = reader.read_line()
+            self._send(conn, "334 " + base64.encode("Password:") + "\r\n")
+            var p = reader.read_line()
+            if u != None and p != None:
+                user = auth.verify_login(u, p, self.auth_lookup)
+        elif mech == "CRAM-MD5":
+            var challenge = "<" + String(time.timens()) + "@" + self.hostname + ">"
+            self._send(conn, "334 " + base64.encode(challenge) + "\r\n")
+            var resp = reader.read_line()
+            if resp != None:
+                user = auth.verify_cram_md5(Bytes(challenge), resp, self.auth_lookup)
+        else:
+            self._send(conn, "504 5.7.4 Unrecognized authentication type\r\n")
+            return None
+        if user != None:
+            self._send(conn, "235 2.7.0 Authentication successful\r\n")
+            return user
+        self._send(conn, "535 5.7.8 Authentication credentials invalid\r\n")
+        return None
+
+    # Handle one accepted connection through to QUIT/close. Returns the list of messages received.
+    var handle = Function(self, conn):
+        var reader = tport.make_socket_reader(conn)
+        self._send(conn, "220 " + self.hostname + " ESMTP smtp.ki ready\r\n")
+        var mail_from = None
+        var rcpts = []
+        var authed = None
+        var bdat = ""
+        var received = []
+        try:
+            while True:
+                var line = reader.read_line()
+                if line == None:
+                    break
+                var parts = line.split(" ")
+                var cmd = parts[0].upper()
+                if cmd == "EHLO":
+                    self._send(conn, self._caps())
+                elif cmd == "HELO":
+                    self._send(conn, "250 " + self.hostname + "\r\n")
+                elif cmd == "STARTTLS":
+                    self._send(conn, "454 4.7.0 TLS not available on this server\r\n")
+                elif cmd == "AUTH":
+                    var mech = ""
+                    if len(parts) >= 2:
+                        mech = parts[1].upper()
+                    authed = self._server_auth(conn, reader, mech, parts)
+                elif cmd == "MAIL":
+                    if self.require_auth and authed == None:
+                        self._send(conn, "530 5.7.0 Authentication required\r\n")
+                    else:
+                        mail_from = _extract_addr(line)
+                        rcpts = []
+                        bdat = ""
+                        self._send(conn, "250 2.1.0 Ok\r\n")
+                elif cmd == "RCPT":
+                    if mail_from == None:
+                        self._send(conn, "503 5.5.1 Need MAIL before RCPT\r\n")
+                    else:
+                        rcpts.append(_extract_addr(line))
+                        self._send(conn, "250 2.1.5 Ok\r\n")
+                elif cmd == "DATA":
+                    if mail_from == None or len(rcpts) == 0:
+                        self._send(conn, "503 5.5.1 Need MAIL and RCPT before DATA\r\n")
+                    else:
+                        self._send(conn, "354 End data with <CR><LF>.<CR><LF>\r\n")
+                        var data = self._read_data(reader)
+                        if data == None:
+                            break
+                        received.append(self._deliver(conn, mail_from, rcpts, data))
+                        mail_from = None
+                        rcpts = []
+                elif cmd == "BDAT":
+                    var size = 0
+                    if len(parts) >= 2:
+                        size = Integer(parts[1])
+                    var is_last = len(parts) >= 3 and parts[2].upper() == "LAST"
+                    bdat = bdat + reader.read_bytes(size)
+                    if is_last:
+                        received.append(self._deliver(conn, mail_from, rcpts, bdat))
+                        mail_from = None
+                        rcpts = []
+                        bdat = ""
+                    else:
+                        self._send(conn, "250 2.0.0 " + String(size) + " octets received\r\n")
+                elif cmd == "RSET":
+                    mail_from = None
+                    rcpts = []
+                    bdat = ""
+                    self._send(conn, "250 2.0.0 Ok\r\n")
+                elif cmd == "NOOP":
+                    self._send(conn, "250 2.0.0 Ok\r\n")
+                elif cmd == "VRFY":
+                    self._send(conn, "252 2.1.5 Cannot VRFY user, but will accept message\r\n")
+                elif cmd == "EXPN":
+                    self._send(conn, "252 2.1.5 Cannot EXPN\r\n")
+                elif cmd == "HELP":
+                    self._send(conn, "214 2.0.0 See RFC 5321\r\n")
+                elif cmd == "QUIT":
+                    self._send(conn, "221 2.0.0 " + self.hostname + " closing connection\r\n")
+                    break
+                else:
+                    self._send(conn, "500 5.5.2 Command unrecognized: " + cmd + "\r\n")
+        catch as e:
+            discard e
+        conn.close()
+        return received
+
+    var _deliver = Function(self, conn, sender, rcpts, data):
+        var accepted = True
+        if self.on_message != None:
+            accepted = self.on_message(sender, rcpts, data)
+        var msg = {"sender": sender, "recipients": rcpts, "data": data}
+        if accepted:
+            self.messages.append(msg)
+            self._send(conn, "250 2.0.0 Ok: queued\r\n")
+        else:
+            self._send(conn, "550 5.7.1 Message rejected\r\n")
+        return msg
+
+    # Accept and fully handle exactly one connection.
+    var serve_once = Function(self):
+        if self._sock == None:
+            self.bind()
+        var conn = self._sock.accept()
+        return self.handle(conn)
+
+    # Accept + handle connections in a loop until `max` have been served (None = forever).
+    var serve_forever = Function(self, max = None):
+        if self._sock == None:
+            self.bind()
+        var n = 0
+        while max == None or n < max:
+            var conn = self._sock.accept()
+            self.handle(conn)
+            n = n + 1
+
+    var close = Function(self):
+        if self._sock != None:
+            var s = self._sock
+            self._sock = None
+            try:
+                s.close()
+            catch as e:
+                discard e

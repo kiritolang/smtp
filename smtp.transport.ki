@@ -84,6 +84,11 @@ class _ScriptSource:
         self._pos = end
         return out
 
+# Build a buffered LineReader over an already-connected/accepted socket (used by the server framework,
+# which owns the raw socket from accept()).
+var make_socket_reader = Function(sock, bufsize = 8192):
+    return LineReader(_SockSource(sock, bufsize))
+
 # A real network transport: a connected TCP socket with buffered line reading and in-place TLS upgrade
 # (STARTTLS or implicit SMTPS) via the interpreter's socket-level TLS (ki >= 1.13.0).
 class PlainTransport:
