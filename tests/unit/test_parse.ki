@@ -1,0 +1,75 @@
+# Unit tests for smtp.parse — reply-line grammar, enhanced status codes, EHLO capability parsing.
+var p = import("smtp.parse")
+var t = import("harness").Tester("parse")
+
+# --- parse_reply_line: final vs continuation ---
+var r = p.parse_reply_line("250 OK")
+t.eq("final code", r["code"], 250)
+t.check("final not cont", not r["cont"])
+t.eq("final text", r["text"], "OK")
+t.eq("final esc", r["esc"], None)
+
+var c = p.parse_reply_line("250-mx.example.com at your service")
+t.eq("cont code", c["code"], 250)
+t.check("cont is cont", c["cont"])
+t.eq("cont text", c["text"], "mx.example.com at your service")
+
+# bare 3-digit line is a valid final reply with empty text
+var b = p.parse_reply_line("221")
+t.eq("bare code", b["code"], 221)
+t.check("bare not cont", not b["cont"])
+t.eq("bare text", b["text"], "")
+
+# --- enhanced status codes (RFC 3463) ---
+var e = p.parse_reply_line("550 5.1.1 No such user")
+t.eq("esc code", e["code"], 550)
+t.eq("esc value", e["esc"], "5.1.1")
+t.eq("esc text keeps full", e["text"], "5.1.1 No such user")
+var ne = p.parse_reply_line("250 2 not an esc")
+t.eq("not esc", ne["esc"], None)
+
+# --- reply_class ---
+t.eq("class 2xx", p.reply_class(250), 2)
+t.eq("class 3xx", p.reply_class(354), 3)
+t.eq("class 4xx", p.reply_class(452), 4)
+t.eq("class 5xx", p.reply_class(550), 5)
+
+# --- malformed lines throw SmtpResponseError ---
+t.raises("too short", Function(): return p.parse_reply_line("25"), "malformed")
+t.raises("non-numeric code", Function(): return p.parse_reply_line("2X0 bad"), "malformed")
+t.raises("bad separator", Function(): return p.parse_reply_line("250xOK"), "bad separator")
+t.raises("empty line", Function(): return p.parse_reply_line(""), "malformed")
+
+# --- is_digits / split_ws / visible ---
+t.check("is_digits yes", p.is_digits("012349"))
+t.check("is_digits no", not p.is_digits("12a"))
+t.check("is_digits empty", not p.is_digits(""))
+t.eq("split_ws", p.split_ws("PLAIN   LOGIN\tCRAM-MD5"), ["PLAIN", "LOGIN", "CRAM-MD5"])
+t.eq("visible", p.visible("a\r\nb\t"), "a\\r\\nb\\t")
+
+# --- parse_ehlo ---
+var lines = [
+    "mx.example.com Hello client [1.2.3.4]",
+    "SIZE 35882577",
+    "8BITMIME",
+    "STARTTLS",
+    "AUTH PLAIN LOGIN CRAM-MD5",
+    "SMTPUTF8",
+    "PIPELINING",
+    "ENHANCEDSTATUSCODES"
+]
+var eh = p.parse_ehlo(lines)
+t.eq("greeting", eh["greeting"], "mx.example.com Hello client [1.2.3.4]")
+t.check("has STARTTLS", "STARTTLS" in eh["ext"])
+t.eq("SIZE param", eh["ext"]["SIZE"], "35882577")
+t.check("has 8BITMIME", "8BITMIME" in eh["ext"])
+t.check("has SMTPUTF8", "SMTPUTF8" in eh["ext"])
+t.eq("auth mechs", p.auth_mechanisms(eh["ext"]), ["PLAIN", "LOGIN", "CRAM-MD5"])
+t.eq("no auth", p.auth_mechanisms({}), [])
+
+# keyword casing is normalized to upper; params preserved
+var eh2 = p.parse_ehlo(["greet", "size 100", "auth login"])
+t.eq("lowercase kw upcased", eh2["ext"]["SIZE"], "100")
+t.eq("lowercase auth", p.auth_mechanisms(eh2["ext"]), ["LOGIN"])
+
+t.done()

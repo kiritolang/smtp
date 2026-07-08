@@ -1,0 +1,109 @@
+# Parsing the SMTP reply grammar: a single reply line, a multi-line reply's continuation flag, RFC 3463
+# enhanced status codes, and the EHLO capability list. Pure String work — no sockets. The reply reader
+# in `smtp.client` drives these; keeping the grammar here makes it independently testable.
+
+var errors = import("smtp.errors")
+
+# True iff `s` is one or more ASCII digits (0-9) and nothing else.
+var is_digits = Function(s):
+    if len(s) == 0:
+        return False
+    for c in s:
+        if c < "0" or c > "9":
+            return False
+    return True
+
+# Split on runs of whitespace, dropping empty fields (like Python's str.split() with no args).
+var split_ws = Function(s):
+    return s.split()
+
+# Make control characters visible in a diagnostic without letting them corrupt the terminal / an
+# injected newline masquerade as a new line.
+var visible = Function(s):
+    return s.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+# Detect + peel an RFC 3463 enhanced status code ("class.subject.detail") that may lead the reply text.
+# Returns [esc_or_None, rest_text].
+var _looks_esc = Function(head):
+    var parts = head.split(".")
+    if len(parts) != 3:
+        return False
+    for p in parts:
+        if not is_digits(p):
+            return False
+    # class is a single digit 2/4/5 per the RFC, but be liberal in what we accept.
+    return True
+
+var parse_esc = Function(text):
+    var sp = text.find(" ")
+    var head = text
+    if sp >= 0:
+        head = text[0:sp]
+    if _looks_esc(head):
+        var rest = ""
+        if sp >= 0:
+            rest = text[sp + 1:]
+        return [head, rest]
+    return [None, text]
+
+# Parse one reply line (already stripped of its trailing CRLF). Returns a Dict:
+#   code  Integer   the 3-digit reply code
+#   cont  Bool      True if this is a continuation line ("250-..."), False on the final line ("250 ...")
+#   text  String    everything after the "<code><sep>" prefix (still includes any enhanced code)
+#   esc   String?   the enhanced status code if the text began with one, else None
+# A line whose first three characters are not digits, or whose 4th character is neither '-' nor ' ',
+# is a protocol violation -> SmtpResponseError (code 0 means "no valid reply code was present").
+var parse_reply_line = Function(line):
+    if len(line) < 3 or not is_digits(line[0:3]):
+        throw errors.SmtpResponseError(0, "malformed server reply: '" + visible(line) + "'")
+    var code = Integer(line[0:3])
+    var cont = False
+    var text = ""
+    if len(line) >= 4:
+        var sep = line[3:4]
+        if sep == "-":
+            cont = True
+        elif sep == " ":
+            cont = False
+        else:
+            throw errors.SmtpResponseError(0, "malformed server reply (bad separator): '" + visible(line) + "'")
+        text = line[4:]
+    var esc = parse_esc(text)[0]
+    return {"code": code, "cont": cont, "text": text, "esc": esc}
+
+# The reply class: 2 (completion), 3 (intermediate), 4 (transient failure), 5 (permanent failure).
+var reply_class = Function(code):
+    return code // 100
+
+# Parse the text lines of an EHLO reply into {greeting, ext}. `lines` is the list of `text` fields
+# from each reply line (the code/sep already stripped). The first line is the greeting; each remaining
+# line is "KEYWORD [params]". `ext` maps the upper-cased keyword to its raw parameter string ("" if
+# none). AUTH's params are the space-separated mechanism list; SIZE's is the max message size.
+var parse_ehlo = Function(lines):
+    var greeting = ""
+    if len(lines) > 0:
+        greeting = lines[0]
+    var ext = {}
+    var i = 1
+    while i < len(lines):
+        var ln = lines[i].strip()
+        i = i + 1
+        if len(ln) == 0:
+            continue
+        var sp = ln.find(" ")
+        var kw = ln
+        var params = ""
+        if sp >= 0:
+            kw = ln[0:sp]
+            params = ln[sp + 1:].strip()
+        ext[kw.upper()] = params
+    return {"greeting": greeting, "ext": ext}
+
+# The AUTH mechanisms a parsed EHLO `ext` advertises, upper-cased. Empty list if AUTH wasn't offered.
+var auth_mechanisms = Function(ext):
+    if not ("AUTH" in ext):
+        return []
+    var out = []
+    for m in split_ws(ext["AUTH"]):
+        out.append(m.upper())
+    return out

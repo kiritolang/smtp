@@ -1,0 +1,202 @@
+# The transport layer: the one place that touches sockets and TLS, so the SMTP state machine in
+# `smtp.client` can be driven either over a real network (`PlainTransport`) or by a scripted test
+# double (`FakeTransport`) with identical calls. A transport exposes:
+#     connect()                     open the connection (no-op for the fake)
+#     read_line() -> String|None    next CRLF-terminated reply line (None at EOF / peer close)
+#     write(data)                   send raw String or Bytes
+#     starttls(server_hostname, verify)   upgrade the live connection to TLS in place
+#     is_tls() -> Bool              is a TLS session active?
+#     cipher() -> String            negotiated cipher ("" when not encrypted)
+#     close()                       close the connection
+
+var net = import("net")
+var errors = import("smtp.errors")
+
+# A buffered line reader over a byte `source` (any object with recv() -> String, "" at EOF). recv is
+# expected to hand back latin-1-decoded text (byte-transparent), so line splitting is plain String
+# work. This is the SMTP reply reader; it reassembles lines that arrive across arbitrary recv chunks.
+class LineReader:
+    var _init_ = Function(self, source):
+        self._source = source
+        self._buf = ""
+        self._eof = False
+
+    var _fill = Function(self):
+        if self._eof:
+            return False
+        var chunk = self._source.recv()
+        if len(chunk) == 0:
+            self._eof = True
+            return False
+        self._buf = self._buf + chunk
+        return True
+
+    var read_line = Function(self):
+        # One line without its trailing CRLF/LF, or None at EOF with nothing left buffered.
+        while True:
+            var nl = self._buf.find("\n")
+            if nl >= 0:
+                var line = self._buf[0:nl]
+                self._buf = self._buf[nl + 1:]
+                if len(line) > 0 and line[len(line) - 1:] == "\r":
+                    line = line[0:len(line) - 1]
+                return line
+            if not self._fill():
+                if len(self._buf) == 0:
+                    return None
+                var rest = self._buf
+                self._buf = ""
+                return rest
+
+    var read_bytes = Function(self, n):
+        while len(self._buf) < n:
+            if not self._fill():
+                break
+        var take = n
+        if take > len(self._buf):
+            take = len(self._buf)
+        var out = self._buf[0:take]
+        self._buf = self._buf[take:]
+        return out
+
+# recv() source over a real socket: hand back the next chunk as latin-1 text ("" at EOF / peer close).
+class _SockSource:
+    var _init_ = Function(self, sock, bufsize = 8192):
+        self._sock = sock
+        self._bufsize = bufsize
+    var recv = Function(self):
+        return self._sock.recv(self._bufsize).decode("latin-1")
+
+# recv() source over a fixed script String, optionally delivered in fixed-size chunks so tests can
+# simulate arbitrary recv() split boundaries (a reply line split across two reads, etc).
+class _ScriptSource:
+    var _init_ = Function(self, script, chunk = None):
+        self._s = script
+        self._pos = 0
+        self._chunk = chunk
+    var recv = Function(self):
+        if self._pos >= len(self._s):
+            return ""
+        var end = len(self._s)
+        if self._chunk != None and self._pos + self._chunk < end:
+            end = self._pos + self._chunk
+        var out = self._s[self._pos:end]
+        self._pos = end
+        return out
+
+# A real network transport: a connected TCP socket with buffered line reading and in-place TLS upgrade
+# (STARTTLS or implicit SMTPS) via the interpreter's socket-level TLS (ki >= 1.13.0).
+class PlainTransport:
+    var _init_ = Function(self, host, port, timeout = 30):
+        self.host = host
+        self.port = port
+        self._timeout = timeout
+        self._sock = None
+        self._reader = None
+
+    var connect = Function(self):
+        var s = net.Socket()
+        if self._timeout != None and self._timeout > 0:
+            s.settimeout(self._timeout)
+        try:
+            s.connect(self.host, self.port)
+        catch as e:
+            throw errors.SmtpConnectError("could not connect to " + self.host + ":" + String(self.port) + ": " + String(e))
+        self._sock = s
+        self._reader = LineReader(_SockSource(s))
+
+    var read_line = Function(self):
+        try:
+            return self._reader.read_line()
+        catch as e:
+            throw errors.SmtpServerDisconnected("read failed: " + String(e))
+
+    var write = Function(self, data):
+        try:
+            self._sock.send(data)
+        catch as e:
+            throw errors.SmtpServerDisconnected("send failed: " + String(e))
+
+    var starttls = Function(self, server_hostname = None, verify = True):
+        if not net.tlsenabled:
+            throw errors.SmtpTlsError("this ki build has no TLS (net.tlsenabled is False); cannot start TLS")
+        var hn = server_hostname
+        if hn == None:
+            hn = self.host
+        try:
+            self._sock.starttls(server_hostname = hn, verify = verify)
+        catch as e:
+            throw errors.SmtpTlsError("TLS handshake with " + String(hn) + " failed: " + String(e))
+        # Rewrap the reader on the now-encrypted socket, discarding any pre-TLS buffered bytes. A
+        # compliant server sends nothing after its "220 ready" before the handshake; discarding is also
+        # the safe response to a STARTTLS command-injection attempt (buffered plaintext is never trusted
+        # as if it arrived inside the TLS session).
+        self._reader = LineReader(_SockSource(self._sock))
+
+    var is_tls = Function(self):
+        if self._sock == None:
+            return False
+        return self._sock.is_tls
+
+    var cipher = Function(self):
+        if self._sock == None or not self._sock.is_tls:
+            return ""
+        return self._sock.cipher()
+
+    var close = Function(self):
+        if self._sock != None:
+            var s = self._sock
+            self._sock = None
+            try:
+                s.close()
+            catch as e:
+                discard e
+
+# A scripted, socket-free transport for deterministic tests. `script` is the full server side as a
+# latin-1 String (all reply lines, CRLF-terminated, concatenated in the order the server would send
+# them); the client reads them turn by turn. `chunk` optionally forces recv() to deliver at most that
+# many characters at a time. Everything the client writes accumulates in `.sent`; when the script is
+# exhausted read_line() returns None, simulating a mid-dialog disconnect.
+class FakeTransport:
+    var _init_ = Function(self, script, chunk = None):
+        self._reader = LineReader(_ScriptSource(script, chunk))
+        self.sent = ""
+        self._tls = False
+        self.tls_args = None
+        self.closed = False
+
+    var connect = Function(self):
+        pass
+
+    var read_line = Function(self):
+        return self._reader.read_line()
+
+    var write = Function(self, data):
+        if isinstance(data, Bytes):
+            self.sent = self.sent + data.decode("latin-1")
+        else:
+            self.sent = self.sent + data
+
+    var starttls = Function(self, server_hostname = None, verify = True):
+        if self._tls:
+            throw errors.SmtpTlsError("starttls called twice on the same connection")
+        self._tls = True
+        self.tls_args = {"server_hostname": server_hostname, "verify": verify}
+
+    var is_tls = Function(self):
+        return self._tls
+
+    var cipher = Function(self):
+        if self._tls:
+            return "FAKE-TLS-AES256"
+        return ""
+
+    var close = Function(self):
+        self.closed = True
+
+    # Test helper: the lines the client wrote (split on CRLF, trailing empty dropped).
+    var lines_written = Function(self):
+        var raw = self.sent.split("\r\n")
+        if len(raw) > 0 and raw[len(raw) - 1] == "":
+            raw = raw[0:len(raw) - 1]
+        return raw

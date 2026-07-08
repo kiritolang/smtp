@@ -1,0 +1,20 @@
+{
+  "name": "smtp",
+  "version": "0.1.0",
+  "modules": [
+    "smtp.ki",
+    "smtp.client.ki",
+    "smtp.server.ki",
+    "smtp.transport.ki",
+    "smtp.auth.ki",
+    "smtp.hmac.ki",
+    "smtp.md4.ki",
+    "smtp.message.ki",
+    "smtp.mime.ki",
+    "smtp.msgparse.ki",
+    "smtp.address.ki",
+    "smtp.parse.ki",
+    "smtp.errors.ki"
+  ],
+  "dependencies": []
+}
