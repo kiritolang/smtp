@@ -266,10 +266,48 @@ class SmtpClient:
             throw errors.SmtpDataError("message content rejected: " + String(final.code) + " " + final.text(), final.code, final.esc)
         return final
 
+    # CHUNKING (RFC 3030): send the message as a single BDAT LAST chunk (no dot-stuffing, exact byte
+    # count). Requires the server to advertise CHUNKING.
+    var data_bdat = Function(self, message):
+        var payload = to_crlf(message).encode("utf-8")
+        self._t.write("BDAT " + String(len(payload)) + " LAST\r\n")
+        self._t.write(payload)
+        var final = self._getreply()
+        if final.code != 250:
+            throw errors.SmtpDataError("BDAT content rejected: " + String(final.code) + " " + final.text(), final.code, final.esc)
+        return final
+
+    # Build MAIL FROM ESMTP parameters from server capabilities + message flags (unsupported params are
+    # silently dropped so a call is always safe).
+    var mail_options = Function(self, size = None, eightbit = False, binarymime = False, smtputf8 = False, dsn_ret = None, dsn_envid = None):
+        var opts = []
+        if size != None and self.has_extension("SIZE"):
+            opts.append("SIZE=" + String(size))
+        if binarymime and self.has_extension("BINARYMIME"):
+            opts.append("BODY=BINARYMIME")
+        elif eightbit and self.has_extension("8BITMIME"):
+            opts.append("BODY=8BITMIME")
+        if smtputf8 and self.has_extension("SMTPUTF8"):
+            opts.append("SMTPUTF8")
+        if dsn_ret != None and self.has_extension("DSN"):
+            opts.append("RET=" + dsn_ret)
+        if dsn_envid != None and self.has_extension("DSN"):
+            opts.append("ENVID=" + dsn_envid)
+        return opts
+
+    # Build RCPT TO DSN parameters (RFC 3461). notify e.g. "SUCCESS,FAILURE,DELAY" or "NEVER".
+    var rcpt_options = Function(self, notify = None, orcpt = None):
+        var opts = []
+        if notify != None and self.has_extension("DSN"):
+            opts.append("NOTIFY=" + notify)
+        if orcpt != None and self.has_extension("DSN"):
+            opts.append("ORCPT=" + orcpt)
+        return opts
+
     # The full RFC 5321 transaction. `recipients` may be a String or a list. Returns a Dict of refused
     # recipients (addr -> [code, esc, text]); empty when all were accepted. Throws SmtpSenderRefused if
     # MAIL is refused, SmtpRecipientsRefused if EVERY recipient is refused, SmtpDataError if DATA fails.
-    var sendmail = Function(self, from_addr, recipients, message, mail_options = None, rcpt_options = None):
+    var sendmail = Function(self, from_addr, recipients, message, mail_options = None, rcpt_options = None, use_bdat = False):
         var rcpts = recipients
         if isinstance(recipients, String):
             rcpts = [recipients]
@@ -290,7 +328,10 @@ class SmtpClient:
             catch as e:
                 discard e
             throw errors.SmtpRecipientsRefused(refused)
-        self.data(message)
+        if use_bdat and self.has_extension("CHUNKING"):
+            self.data_bdat(message)
+        else:
+            self.data(message)
         return refused
 
     # --- housekeeping ---

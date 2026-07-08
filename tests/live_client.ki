@@ -1,0 +1,43 @@
+# Driven by tests/test_smtp_live.py against the Python mock server: connect over real TLS (STARTTLS or
+# implicit SMTPS per arglist[2]), authenticate, send a message, and print "ALL OK cipher=..." on
+# success. Skips (exit 0) with "SKIP" when the interpreter has no TLS. Args: <host> <port> <starttls|tls>
+var io = import("io")
+var net = import("net")
+var sys = import("sys")
+var client_mod = import("smtp.client")
+var msg = import("smtp.message")
+
+if not net.tlsenabled:
+    io.print("SKIP: net.tlsenabled is False in this ki build")
+    sys.exit(0)
+
+var host = arglist[0]
+var port = Integer(arglist[1])
+var mode = arglist[2]
+
+var c = client_mod.SmtpClient(host = host, port = port, local_hostname = "client.test", timeout = 20)
+if mode == "smtps" or mode == "tls":
+    c.connect_tls(server_hostname = host, verify = False)
+    c.ehlo()
+else:
+    c.connect()
+    c.ehlo()
+    c.starttls(server_hostname = host, verify = False)
+
+if not c.is_tls():
+    io.print("FAIL: not TLS after negotiation")
+    sys.exit(1)
+var cipher = c.cipher()
+if len(cipher) == 0:
+    io.print("FAIL: cipher() empty over TLS")
+    sys.exit(1)
+
+c.login("alice", "secret", "LOGIN")
+var m = msg.MailBuilder().from_("alice@test.mx", "Alice").to("bob@dest.com", "Bob").subject("Encrypted ✓")
+m.text("secret over TLS\n.dot stays\n")
+var refused = c.sendmail(m.envelope_sender(), m.recipients(), m.build())
+if len(refused) != 0:
+    io.print("FAIL: recipients refused " + String(refused))
+    sys.exit(1)
+c.quit()
+io.print("ALL OK cipher=" + cipher)
