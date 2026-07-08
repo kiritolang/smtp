@@ -1,0 +1,126 @@
+# The `smtp` package facade: `import("smtp")`. Re-exports the public surface (SmtpClient, SmtpServer,
+# MailBuilder/Message, parse_message, the exception classes) and provides the high-level one-shot
+# `send()` that connects, negotiates TLS, authenticates, and runs the mail transaction end to end.
+
+var client_mod = import("smtp.client")
+var server_mod = import("smtp.server")
+var message_mod = import("smtp.message")
+var msgparse = import("smtp.msgparse")
+var address_mod = import("smtp.address")
+var mime = import("smtp.mime")
+var errors = import("smtp.errors")
+
+# --- re-exports ---------------------------------------------------------------------------------
+
+var SmtpClient = client_mod.SmtpClient
+var SmtpServer = server_mod.SmtpServer
+var MailBuilder = message_mod.MailBuilder
+var Message = message_mod.Message
+var parse_message = msgparse.parse
+var parse_address = address_mod.parse_one
+var parse_address_list = address_mod.parse_list
+
+var SmtpError = errors.SmtpError
+var SmtpConnectError = errors.SmtpConnectError
+var SmtpServerDisconnected = errors.SmtpServerDisconnected
+var SmtpTimeout = errors.SmtpTimeout
+var SmtpTlsError = errors.SmtpTlsError
+var SmtpAuthError = errors.SmtpAuthError
+var SmtpResponseError = errors.SmtpResponseError
+var SmtpHeloError = errors.SmtpHeloError
+var SmtpSenderRefused = errors.SmtpSenderRefused
+var SmtpRecipientsRefused = errors.SmtpRecipientsRefused
+var SmtpDataError = errors.SmtpDataError
+
+# --- helpers ------------------------------------------------------------------------------------
+
+var _byte_len = Function(s):
+    return len(s.encode("utf-8"))
+
+var _needs_utf8 = Function(raw, addrs):
+    if not mime.is_ascii(raw):
+        return True
+    for a in addrs:
+        if not mime.is_ascii(a):
+            return True
+    return False
+
+var _default_port = Function(security):
+    if security == "tls":
+        return 465
+    return 587
+
+# --- the high-level send ------------------------------------------------------------------------
+
+# Send a message end to end. `message` is a MailBuilder/Message (its build() + envelope are used) or a
+# pre-built raw String (then from_addr and to are required). `security` is one of:
+#   "starttls" (default, port 587): plaintext, then upgrade — fails if the server won't STARTTLS
+#   "tls"      (SMTPS, port 465):   implicit TLS from the first byte
+#   "auto":                          STARTTLS if offered, else plaintext
+#   "plain":                         no encryption
+# Returns a Dict of refused recipients (empty when all accepted). Raises an SmtpError on failure.
+var send = Function(message, host, port = None, username = None, password = None, security = "starttls", verify = True, server_hostname = None, timeout = 30, auth_mechanism = "auto", helo_name = None, from_addr = None, to = None, dsn_ret = None, dsn_notify = None, use_bdat = False, client = None):
+    var raw = None
+    var envelope_from = from_addr
+    var recipients = to
+    if isinstance(message, String):
+        raw = message
+    else:
+        raw = message.build()
+        if envelope_from == None:
+            envelope_from = message.envelope_sender()
+        if recipients == None:
+            recipients = message.recipients()
+    if isinstance(recipients, String):
+        recipients = [recipients]
+    if envelope_from == None:
+        throw errors.SmtpError("send: no envelope sender (pass from_addr, or a MailBuilder with a From)")
+    if recipients == None or len(recipients) == 0:
+        throw errors.SmtpError("send: no recipients (pass to, or a MailBuilder with recipients)")
+
+    var p = port
+    if p == None:
+        p = _default_port(security)
+
+    var c = client
+    if c == None:
+        c = client_mod.SmtpClient(host = host, port = p, timeout = timeout, local_hostname = helo_name)
+    try:
+        if security == "tls":
+            c.connect_tls(server_hostname = server_hostname, verify = verify)
+            c.ehlo(helo_name)
+        else:
+            c.connect()
+            c.ehlo(helo_name)
+            if security == "starttls":
+                c.starttls(server_hostname = server_hostname, verify = verify, name = helo_name)
+            elif security == "auto" and c.has_extension("STARTTLS"):
+                c.starttls(server_hostname = server_hostname, verify = verify, name = helo_name)
+
+        if username != None and password != None:
+            c.login(username, password, auth_mechanism)
+
+        var addrs = recipients + [envelope_from]
+        var mo = c.mail_options(size = _byte_len(raw), eightbit = (not mime.is_ascii(raw)), smtputf8 = _needs_utf8(raw, addrs), dsn_ret = dsn_ret)
+        var ro = c.rcpt_options(notify = dsn_notify)
+        var refused = c.sendmail(envelope_from, recipients, raw, mo, ro, use_bdat)
+        c.quit()
+        return refused
+    catch errors.SmtpError as e:
+        try:
+            c.close()
+        catch as e2:
+            discard e2
+        throw e
+
+# Convenience: build + send a simple text (or text+html) message in one call.
+var sendmail = Function(host, from_addr, to, subject, body, username = None, password = None, html = None, security = "starttls", port = None, verify = True, timeout = 30):
+    var m = message_mod.MailBuilder().from_(from_addr).subject(subject).text(body)
+    var tos = to
+    if isinstance(to, String):
+        tos = [to]
+    for r in tos:
+        m.to(r)
+    if html != None:
+        m.html(html)
+    return send(m, host, port, username, password, security, verify, None, timeout)

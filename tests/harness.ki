@@ -1,0 +1,75 @@
+# Tiny self-asserting test harness shared by tests/unit/*.ki. No external framework — just a counter,
+# a few assertion helpers, and a summary line that exits non-zero if anything failed (so run_tests.sh
+# and CI see the failure). Imported as `import("harness")` with the tests/ dir on the import path.
+#
+#   var t = import("harness").Tester("parse")
+#   t.eq("code", got, 250)
+#   t.check("is final", not reply["cont"])
+#   t.raises("bad line", Function(): return p.parse_reply_line("xx"), "malformed")
+#   t.done()
+
+var io = import("io")
+
+var show = Function(v):
+    if isinstance(v, String):
+        return "'" + v + "'"
+    return String(v)
+
+class Tester:
+    var _init_ = Function(self, title):
+        self.title = title
+        self.passed = 0
+        self.failed = 0
+
+    var check = Function(self, name, cond):
+        if cond:
+            self.passed = self.passed + 1
+        else:
+            self.failed = self.failed + 1
+            io.print("FAIL [" + self.title + "] " + name)
+        return cond
+
+    var eq = Function(self, name, got, want):
+        if got == want:
+            self.passed = self.passed + 1
+            return True
+        self.failed = self.failed + 1
+        io.print("FAIL [" + self.title + "] " + name + ": got " + show(got) + " want " + show(want))
+        return False
+
+    # Assert `fn()` throws, and (if substr is non-empty) that String(exception) contains substr.
+    var raises = Function(self, name, fn, substr):
+        var threw = False
+        var msg = ""
+        try:
+            fn()
+        catch as e:
+            threw = True
+            msg = String(e)
+        if not threw:
+            self.failed = self.failed + 1
+            io.print("FAIL [" + self.title + "] " + name + ": expected an exception, none thrown")
+            return False
+        if len(substr) > 0 and msg.find(substr) < 0:
+            self.failed = self.failed + 1
+            io.print("FAIL [" + self.title + "] " + name + ": exception " + show(msg) + " lacks " + show(substr))
+            return False
+        self.passed = self.passed + 1
+        return True
+
+    # Assert `fn()` does NOT throw; returns its value (or None on failure).
+    var ok = Function(self, name, fn):
+        try:
+            var v = fn()
+            self.passed = self.passed + 1
+            return v
+        catch as e:
+            self.failed = self.failed + 1
+            io.print("FAIL [" + self.title + "] " + name + ": unexpected exception " + show(String(e)))
+            return None
+
+    var done = Function(self):
+        io.print("")
+        io.print(self.title + ": " + String(self.passed) + " passed, " + String(self.failed) + " failed")
+        if self.failed > 0:
+            import("sys").exit(1)

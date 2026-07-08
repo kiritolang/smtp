@@ -1,0 +1,55 @@
+# Tests for the client's ESMTP extension handling: SIZE / 8BITMIME / SMTPUTF8 / DSN option gating and
+# the BDAT (CHUNKING) send path, all over FakeTransport.
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var t = import("harness").Tester("esmtp")
+
+var pair = Function(script):
+    var f = T.FakeTransport(script)
+    return [C.SmtpClient(transport = f, host = "mx.test", local_hostname = "c.test"), f]
+
+# --- options gated ON when the server advertises the extension ---
+var c1, f1 = pair("220 mx\r\n250-mx\r\n250-SIZE 1000000\r\n250-8BITMIME\r\n250-BINARYMIME\r\n250-SMTPUTF8\r\n250-DSN\r\n250 CHUNKING\r\n")
+c1.connect()
+c1.ehlo()
+t.eq("size opt", c1.mail_options(size = 500), ["SIZE=500"])
+t.eq("8bit opt", c1.mail_options(eightbit = True), ["BODY=8BITMIME"])
+t.eq("binarymime wins over 8bit", c1.mail_options(eightbit = True, binarymime = True), ["BODY=BINARYMIME"])
+t.eq("smtputf8 opt", c1.mail_options(smtputf8 = True), ["SMTPUTF8"])
+t.eq("dsn ret+envid", c1.mail_options(dsn_ret = "FULL", dsn_envid = "abc123"), ["RET=FULL", "ENVID=abc123"])
+t.eq("combined", c1.mail_options(size = 10, eightbit = True, smtputf8 = True), ["SIZE=10", "BODY=8BITMIME", "SMTPUTF8"])
+t.eq("rcpt dsn", c1.rcpt_options(notify = "SUCCESS,FAILURE", orcpt = "rfc822;b@x"), ["NOTIFY=SUCCESS,FAILURE", "ORCPT=rfc822;b@x"])
+
+# --- options dropped when the extension is absent ---
+var c2, f2 = pair("220 mx\r\n250 mx\r\n")
+c2.connect()
+c2.ehlo()
+t.eq("no size cap -> dropped", c2.mail_options(size = 500), [])
+t.eq("no dsn cap -> dropped", c2.rcpt_options(notify = "NEVER"), [])
+
+# --- sendmail puts the MAIL options on the wire ---
+var c3, f3 = pair("220 mx\r\n250-mx\r\n250-SIZE 1000000\r\n250 8BITMIME\r\n250 Ok\r\n250 Ok\r\n354 go\r\n250 queued\r\n")
+c3.connect()
+c3.ehlo()
+c3.sendmail("a@a.com", ["b@b.com"], "Subject: x\r\n\r\nbody\r\n", c3.mail_options(size = 42, eightbit = True))
+t.check("MAIL FROM carries options", f3.sent.find("MAIL FROM:<a@a.com> SIZE=42 BODY=8BITMIME\r\n") >= 0)
+
+# --- BDAT (CHUNKING) send path ---
+var c4, f4 = pair("220 mx\r\n250-mx\r\n250 CHUNKING\r\n250 Ok\r\n250 Ok\r\n250 queued\r\n")
+c4.connect()
+c4.ehlo()
+var payload = "Subject: x\r\n\r\nbody\r\n"
+c4.sendmail("a@a.com", ["b@b.com"], payload, None, None, True)
+t.check("BDAT header sent", f4.sent.find("BDAT " + String(len(payload)) + " LAST\r\n") >= 0)
+t.check("no DATA command", f4.sent.find("DATA\r\n") < 0)
+t.check("BDAT payload raw (no dot-stuffing)", f4.sent.find(payload) >= 0)
+
+# --- DSN options reach RCPT ---
+var c5, f5 = pair("220 mx\r\n250-mx\r\n250 DSN\r\n250 Ok\r\n250 Ok\r\n354 go\r\n250 queued\r\n")
+c5.connect()
+c5.ehlo()
+c5.sendmail("a@a.com", ["b@b.com"], "Subject: x\r\n\r\nb\r\n", c5.mail_options(dsn_ret = "HDRS"), c5.rcpt_options(notify = "FAILURE"))
+t.check("MAIL has RET", f5.sent.find("MAIL FROM:<a@a.com> RET=HDRS\r\n") >= 0)
+t.check("RCPT has NOTIFY", f5.sent.find("RCPT TO:<b@b.com> NOTIFY=FAILURE\r\n") >= 0)
+
+t.done()

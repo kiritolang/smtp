@@ -1,0 +1,46 @@
+# Unit tests for smtp.transport — the buffered line reader (reassembly, CRLF/LF handling, EOF) and the
+# FakeTransport test double (write capture, starttls simulation). PlainTransport is exercised by the
+# live socket tests.
+var T = import("smtp.transport")
+var t = import("harness").Tester("transport")
+
+# One read_line per CRLF-terminated line; None at EOF and stays None.
+var f = T.FakeTransport("220 mx ESMTP\r\n250 OK\r\n")
+t.eq("line1", f.read_line(), "220 mx ESMTP")
+t.eq("line2", f.read_line(), "250 OK")
+t.eq("eof None", f.read_line(), None)
+t.eq("eof stays None", f.read_line(), None)
+
+# Reassembly across arbitrary recv() boundaries: deliver one character per recv.
+var f2 = T.FakeTransport("250-a\r\n250-b\r\n250 c\r\n", 1)
+t.eq("chunked l1", f2.read_line(), "250-a")
+t.eq("chunked l2", f2.read_line(), "250-b")
+t.eq("chunked l3", f2.read_line(), "250 c")
+
+# Bare LF (no CR) is tolerated.
+var f3 = T.FakeTransport("250 bare\n")
+t.eq("bare lf", f3.read_line(), "250 bare")
+
+# A trailing line with no newline is still returned, then EOF.
+var f4 = T.FakeTransport("250 no newline")
+t.eq("no trailing nl", f4.read_line(), "250 no newline")
+t.eq("then eof", f4.read_line(), None)
+
+# write() records everything; String and Bytes both accepted.
+var f5 = T.FakeTransport("")
+f5.write("EHLO x\r\n")
+f5.write(Bytes("MAIL FROM:<a@b>\r\n"))
+t.eq("sent accumulated", f5.sent, "EHLO x\r\nMAIL FROM:<a@b>\r\n")
+t.eq("lines_written", f5.lines_written(), ["EHLO x", "MAIL FROM:<a@b>"])
+
+# starttls flips is_tls()/cipher() and is guarded against a double upgrade.
+var f6 = T.FakeTransport("")
+t.check("not tls initially", not f6.is_tls())
+t.eq("cipher empty", f6.cipher(), "")
+f6.starttls(server_hostname = "mx.example.com", verify = False)
+t.check("tls after", f6.is_tls())
+t.check("cipher set", len(f6.cipher()) > 0)
+t.eq("tls_args recorded", f6.tls_args["server_hostname"], "mx.example.com")
+t.raises("double starttls", Function(): return f6.starttls(), "twice")
+
+t.done()

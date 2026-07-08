@@ -1,0 +1,6 @@
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var c = C.SmtpClient(transport = T.FakeTransport("220 mx\r\n250 mx\r\n"))
+c.connect()
+c.ehlo()
+discard c.starttls(verify = False)

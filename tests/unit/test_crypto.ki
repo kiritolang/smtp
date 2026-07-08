@@ -1,0 +1,36 @@
+# Verify the pure-Kirito HMAC, PBKDF2, and MD4 against published RFC test vectors.
+var H = import("smtp.hmac")
+var MD4 = import("smtp.md4")
+var t = import("harness").Tester("crypto")
+
+# HMAC-MD5 (RFC 2202)
+t.eq("hmac-md5 v1", H.hmac_md5_hex(fromhex("0b" * 16), "Hi There"), "9294727a3638bb1c13f48ef8158bfc9d")
+t.eq("hmac-md5 Jefe", H.hmac_md5_hex("Jefe", "what do ya want for nothing?"), "750c783e6ab0b503eaa86e310a5db738")
+
+# HMAC-SHA1 (RFC 2202)
+t.eq("hmac-sha1 v1", H.hmac_sha1_hex(fromhex("0b" * 20), "Hi There"), "b617318655057264e28bc0b6fb378c8ef146be00")
+t.eq("hmac-sha1 Jefe", H.hmac_sha1_hex("Jefe", "what do ya want for nothing?"), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+
+# HMAC-SHA256 (RFC 4231)
+t.eq("hmac-sha256 v1", H.hmac_sha256_hex(fromhex("0b" * 20), "Hi There"), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+t.eq("hmac-sha256 Jefe", H.hmac_sha256_hex("Jefe", "what do ya want for nothing?"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+
+# key longer than the block (exercises the H(key) path)
+t.eq("hmac-sha1 longkey", H.hmac_sha1_hex(fromhex("aa" * 80), "Test Using Larger Than Block-Size Key - Hash Key First"), "aa4ae5e15272d00e95705637ce8a3b55ed402112")
+
+# PBKDF2-HMAC-SHA1 (RFC 6070)
+t.eq("pbkdf2 c=1", H.pbkdf2(H.hmac_sha1, "password", "salt", 1, 20).hex(), "0c60c80f961f0e71f3a9b524af6012062fe037a6")
+t.eq("pbkdf2 c=2", H.pbkdf2(H.hmac_sha1, "password", "salt", 2, 20).hex(), "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957")
+t.eq("pbkdf2 c=4096", H.pbkdf2(H.hmac_sha1, "password", "salt", 4096, 20).hex(), "4b007901b765489abead49d926f721d065a429c1")
+# multi-block (dkLen 25 > 20)
+t.eq("pbkdf2 multiblock", H.pbkdf2(H.hmac_sha1, "passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 25).hex(), "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038")
+
+# MD4 (RFC 1320)
+t.eq("md4 empty", MD4.md4_hex(""), "31d6cfe0d16ae931b73c59d7e0c089c0")
+t.eq("md4 a", MD4.md4_hex("a"), "bde52cb31de33e46245e05fbdbd6fb24")
+t.eq("md4 abc", MD4.md4_hex("abc"), "a448017aaf21d8525fc10ae87aa6729d")
+t.eq("md4 message digest", MD4.md4_hex("message digest"), "d9130a8164549fe818874806e1c7014b")
+t.eq("md4 alphabet", MD4.md4_hex("abcdefghijklmnopqrstuvwxyz"), "d79e1c308aa5bbcdeea8ed63df412da9")
+t.eq("md4 A-Za-z0-9", MD4.md4_hex("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), "043f8582f241db351ce627e153e7f0e4")
+
+t.done()

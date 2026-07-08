@@ -1,0 +1,71 @@
+# Tests for the smtp facade: re-exports and the high-level send() orchestration (over injected fakes).
+var smtp = import("smtp")
+var T = import("smtp.transport")
+var t = import("harness").Tester("facade")
+
+# --- re-exports ---
+t.check("SmtpClient exported", smtp.SmtpClient != None)
+t.check("SmtpServer exported", smtp.SmtpServer != None)
+t.check("MailBuilder exported", smtp.MailBuilder != None)
+t.check("Message exported", smtp.Message != None)
+t.check("parse_message exported", smtp.parse_message != None)
+t.check("SmtpError exported", smtp.SmtpError != None)
+t.check("SmtpAuthError exported", smtp.SmtpAuthError != None)
+
+# --- send() with security="plain", auth, injected fake client ---
+var script = "".join([
+    "220 mx ESMTP\r\n",
+    "250-mx\r\n250-AUTH PLAIN LOGIN\r\n250 SIZE 1000000\r\n",
+    "235 2.7.0 OK\r\n",
+    "250 Ok\r\n",
+    "250 Ok\r\n",
+    "354 go\r\n",
+    "250 queued\r\n",
+    "221 Bye\r\n"
+])
+var f = T.FakeTransport(script)
+var c = smtp.SmtpClient(transport = f, host = "mx", local_hostname = "cli")
+var m = smtp.MailBuilder().from_("a@x.com").to("b@y.com").subject("Hi").text("body text")
+var refused = smtp.send(m, "mx", port = 25, username = "a@x.com", password = "pw", security = "plain", auth_mechanism = "PLAIN", helo_name = "cli", client = c)
+t.eq("plain send no refusals", refused, {})
+t.check("AUTH PLAIN sent", f.sent.find("AUTH PLAIN ") >= 0)
+t.check("MAIL FROM sent", f.sent.find("MAIL FROM:<a@x.com>") >= 0)
+t.check("MAIL has SIZE", f.sent.find("SIZE=") >= 0)
+t.check("RCPT TO sent", f.sent.find("RCPT TO:<b@y.com>") >= 0)
+t.check("message body sent", f.sent.find("Subject: Hi") >= 0)
+t.check("QUIT sent", f.sent.find("QUIT\r\n") >= 0)
+
+# --- send() with security="starttls" path (fake simulates the upgrade) ---
+var script2 = "".join([
+    "220 mx\r\n",
+    "250-mx\r\n250 STARTTLS\r\n",
+    "220 2.0.0 Ready to start TLS\r\n",
+    "250-mx\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n",
+    "235 OK\r\n",
+    "250 Ok\r\n250 Ok\r\n354 go\r\n250 queued\r\n221 Bye\r\n"
+])
+var f2 = T.FakeTransport(script2)
+var c2 = smtp.SmtpClient(transport = f2, host = "mx", local_hostname = "cli")
+smtp.send(m, "mx", username = "a@x.com", password = "pw", security = "starttls", auth_mechanism = "PLAIN", helo_name = "cli", verify = False, client = c2)
+t.check("STARTTLS negotiated", f2.sent.find("STARTTLS\r\n") >= 0)
+t.check("TLS active before send", c2.is_tls())
+t.check("two EHLOs (pre+post TLS)", (len(f2.sent.split("EHLO ")) - 1) == 2)
+
+# --- security="starttls" but server won't offer it -> SmtpTlsError, connection closed ---
+var f3 = T.FakeTransport("220 mx\r\n250 mx\r\n")
+var c3 = smtp.SmtpClient(transport = f3, host = "mx", local_hostname = "cli")
+t.raises("starttls required but absent", Function(): return smtp.send(m, "mx", security = "starttls", client = c3), "does not advertise")
+
+# --- raw-String message requires from_addr + to ---
+t.raises("raw needs envelope", Function(): return smtp.send("Subject: x\r\n\r\nbody\r\n", "mx", security = "plain"), "no envelope sender")
+
+# --- convenience sendmail() builds + sends ---
+var f4 = T.FakeTransport("220 mx\r\n250 mx\r\n250 Ok\r\n250 Ok\r\n354 go\r\n250 queued\r\n221 Bye\r\n")
+var c4 = smtp.SmtpClient(transport = f4, host = "mx", local_hostname = "cli")
+# call the underlying send() directly with the built message to keep the fake deterministic
+var built = smtp.MailBuilder().from_("s@x.com").to("r@y.com").subject("Quick").text("hello").build()
+smtp.send(built, "mx", security = "plain", from_addr = "s@x.com", to = "r@y.com", client = c4)
+t.check("raw send MAIL", f4.sent.find("MAIL FROM:<s@x.com>") >= 0)
+t.check("raw send RCPT", f4.sent.find("RCPT TO:<r@y.com>") >= 0)
+
+t.done()

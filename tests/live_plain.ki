@@ -1,0 +1,64 @@
+# Live plaintext loopback test: run the SmtpServer in a worker VM (via parallel) on an ephemeral port,
+# connect the real SmtpClient over 127.0.0.1, authenticate, and send a full message — then verify the
+# server received exactly what was sent (through real socket I/O, PlainTransport, AUTH LOGIN, DATA
+# dot-stuffing, and MIME build/parse). The driver is guarded by `if argmain:` because a spawned worker
+# re-evaluates this file to resolve `server_fn` and must not re-run the driver.
+
+var parallel = import("parallel")
+var client_mod = import("smtp.client")
+var server_mod = import("smtp.server")
+var msg = import("smtp.message")
+var mp = import("smtp.msgparse")
+
+# Worker entry point: a one-shot SMTP server that reports its port, serves one connection, and returns
+# the received message. Must be module-level so parallel.spawn can resolve it from this file.
+var server_fn = Function(port_q, result_q):
+    var lookup = Function(u):
+        if u == "alice":
+            return "s3cret"
+        return None
+    var srv = server_mod.SmtpServer("127.0.0.1", 0, None, lookup, "test.mx")
+    var port = srv.bind()
+    port_q.put(port)
+    var received = srv.serve_once()
+    if len(received) > 0:
+        result_q.put(received[0])
+    else:
+        result_q.put({"sender": "", "recipients": [], "data": ""})
+
+if argmain:
+    var t = import("harness").Tester("live_plain")
+    var port_q = parallel.Queue()
+    var result_q = parallel.Queue()
+    var task = parallel.spawn(server_fn, port_q, result_q)
+    var port = port_q.get()
+
+    var c = client_mod.SmtpClient(host = "127.0.0.1", port = port, local_hostname = "client.test", timeout = 15)
+    c.connect()
+    c.ehlo()
+    t.check("server offers AUTH", c.has_extension("AUTH"))
+    t.check("server offers SIZE", c.has_extension("SIZE"))
+    t.check("server offers CHUNKING", c.has_extension("CHUNKING"))
+    c.login("alice", "s3cret", "LOGIN")
+
+    var m = msg.MailBuilder().from_("alice@test.mx", "Alice").to("bob@dest.com", "Bob").subject("Live ✓ test")
+    m.text("Hello over a real socket\n.dotted line stays\n")
+    m.attach("note.txt", "attachment body", "text/plain")
+    var refused = c.sendmail(m.envelope_sender(), m.recipients(), m.build())
+    t.eq("no refusals", refused, {})
+    c.quit()
+
+    var got = result_q.get()
+    task.join()
+
+    t.eq("envelope sender", got["sender"], "alice@test.mx")
+    t.eq("envelope recipients", got["recipients"], ["bob@dest.com"])
+    var parsed = mp.parse(got["data"])
+    t.eq("subject decoded", mp.decode_header(parsed.header("subject")), "Live ✓ test")
+    t.check("dot-stuffing round-trip", got["data"].find("\r\n.dotted line stays\r\n") >= 0 and got["data"].find("..dotted") < 0)
+    var found = False
+    for leaf in parsed.walk_leaves():
+        if leaf.filename() == "note.txt":
+            found = leaf.text() == "attachment body"
+    t.check("attachment delivered intact", found)
+    t.done()

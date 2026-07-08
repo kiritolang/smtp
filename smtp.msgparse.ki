@@ -1,0 +1,220 @@
+# Parsing a raw RFC 5322 / MIME message into a Part tree — the inverse of smtp.message's build(). Splits
+# headers from body, unfolds continuation lines, parses Content-Type parameters, recurses into
+# multipart bodies on the boundary, and decodes the content-transfer-encoding. decode_header() decodes
+# RFC 2047 encoded-words in header values.
+
+var mime = import("smtp.mime")
+var base64 = import("base64")
+
+var _split_headers_body = Function(s):
+    var i = s.find("\r\n\r\n")
+    if i >= 0:
+        return [s[0:i], s[i + 4:]]
+    var j = s.find("\n\n")
+    if j >= 0:
+        return [s[0:j], s[j + 2:]]
+    return [s, ""]
+
+# Header block -> list of [name, value], unfolding continuation (leading-whitespace) lines.
+var parse_headers = Function(block):
+    var norm = block.replace("\r\n", "\n").replace("\r", "\n")
+    var lines = []
+    for rl in norm.split("\n"):
+        if len(rl) > 0 and (rl[0:1] == " " or rl[0:1] == "\t") and len(lines) > 0:
+            lines[len(lines) - 1] = lines[len(lines) - 1] + " " + rl.strip()
+        else:
+            lines.append(rl)
+    var out = []
+    for ln in lines:
+        if len(ln) == 0:
+            continue
+        var colon = ln.find(":")
+        if colon > 0:
+            out.append([ln[0:colon].strip(), ln[colon + 1:].strip()])
+    return out
+
+var _split_semicolons = Function(value):
+    var segs = []
+    var cur = ""
+    var inq = False
+    var i = 0
+    while i < len(value):
+        var c = value[i:i + 1]
+        if c == "\"":
+            inq = not inq
+            cur = cur + c
+        elif c == ";" and not inq:
+            segs.append(cur)
+            cur = ""
+        else:
+            cur = cur + c
+        i = i + 1
+    segs.append(cur)
+    return segs
+
+# "text/plain; charset=utf-8; boundary=xxx" -> ["text/plain", {charset:..., boundary:...}].
+var parse_content_type = Function(value):
+    var segs = _split_semicolons(value)
+    var params = {}
+    var i = 1
+    while i < len(segs):
+        var seg = segs[i].strip()
+        i = i + 1
+        var eq = seg.find("=")
+        if eq >= 0:
+            var k = seg[0:eq].strip().lower()
+            var v = seg[eq + 1:].strip()
+            if len(v) >= 2 and v[0:1] == "\"" and v[len(v) - 1:] == "\"":
+                v = v[1:len(v) - 1]
+            params[k] = v
+    return [segs[0].strip().lower(), params]
+
+var _decode_body = Function(body, cte):
+    var enc = cte.lower().strip()
+    if enc == "base64":
+        return mime.b64_decode_body(body)
+    if enc == "quoted-printable":
+        return mime.qp_decode(body)
+    return body.encode("latin-1")
+
+var _q_decode = Function(text):
+    return mime.qp_decode(text.replace("_", " "))
+
+# Decode RFC 2047 encoded-words in a header value; plain text passes through.
+var decode_header = Function(value):
+    var out = ""
+    var i = 0
+    var n = len(value)
+    var last_ew = False
+    while i < n:
+        var start = value.find("=?", i)
+        if start < 0:
+            out = out + value[i:]
+            break
+        var between = value[i:start]
+        if not (last_ew and len(between.strip()) == 0):
+            out = out + between
+        var q1 = value.find("?", start + 2)
+        var q2 = value.find("?", q1 + 1)
+        var fin = value.find("?=", q2 + 1)
+        if q1 < 0 or q2 < 0 or fin < 0:
+            out = out + value[start:]
+            break
+        var charset = value[start + 2:q1].lower()
+        var enc = value[q1 + 1:q2].upper()
+        var text = value[q2 + 1:fin]
+        var raw = None
+        if enc == "B":
+            raw = Bytes(base64.decode(text))
+        elif enc == "Q":
+            raw = _q_decode(text)
+        else:
+            raw = text.encode("latin-1")
+        var decoded = ""
+        try:
+            decoded = raw.decode(charset)
+        catch as e:
+            discard e
+            decoded = raw.decode("latin-1")
+        out = out + decoded
+        last_ew = True
+        i = fin + 2
+    return out
+
+class Part:
+    var _init_ = Function(self, header_list):
+        self.headers = header_list
+        self._hmap = {}
+        for h in header_list:
+            var k = h[0].lower()
+            if not (k in self._hmap):
+                self._hmap[k] = h[1]
+        var parsed = parse_content_type(self._hmap.get("content-type", "text/plain"))
+        self.content_type = parsed[0]
+        self.params = parsed[1]
+        self.parts = []
+        self.body = None
+
+    var header = Function(self, name, default = None):
+        return self._hmap.get(name.lower(), default)
+
+    var header_decoded = Function(self, name, default = None):
+        var v = self._hmap.get(name.lower(), None)
+        if v == None:
+            return default
+        return decode_header(v)
+
+    var is_multipart = Function(self):
+        return self.content_type.find("multipart/") == 0
+
+    var charset = Function(self):
+        return self.params.get("charset", "utf-8")
+
+    var text = Function(self):
+        if self.body == None:
+            return ""
+        try:
+            return self.body.decode(self.charset())
+        catch as e:
+            discard e
+            return self.body.decode("latin-1")
+
+    var get_bytes = Function(self):
+        return self.body
+
+    var filename = Function(self):
+        var cd = self._hmap.get("content-disposition", None)
+        if cd != None:
+            var p = parse_content_type(cd)[1]
+            if "filename" in p:
+                return p["filename"]
+        if "name" in self.params:
+            return self.params["name"]
+        return None
+
+    # Flatten: this part if a leaf, else all descendant leaves.
+    var walk_leaves = Function(self):
+        if not self.is_multipart():
+            return [self]
+        var out = []
+        for p in self.parts:
+            for leaf in p.walk_leaves():
+                out.append(leaf)
+        return out
+
+var _parse_entity = Function(s):
+    var hb = _split_headers_body(s)
+    var part = Part(parse_headers(hb[0]))
+    if part.is_multipart() and ("boundary" in part.params):
+        part.parts = _parse_multipart(hb[1], part.params["boundary"])
+    else:
+        part.body = _decode_body(hb[1], part.header("content-transfer-encoding", "7bit"))
+    return part
+
+var _parse_multipart = Function(body, boundary):
+    var delim = "--" + boundary
+    var segments = body.split(delim)
+    var out = []
+    var i = 1
+    while i < len(segments):
+        var seg = segments[i]
+        i = i + 1
+        if len(seg) >= 2 and seg[0:2] == "--":
+            break
+        if seg[0:2] == "\r\n":
+            seg = seg[2:]
+        elif seg[0:1] == "\n":
+            seg = seg[1:]
+        if len(seg) >= 2 and seg[len(seg) - 2:] == "\r\n":
+            seg = seg[0:len(seg) - 2]
+        elif len(seg) >= 1 and seg[len(seg) - 1:] == "\n":
+            seg = seg[0:len(seg) - 1]
+        out.append(_parse_entity(seg))
+    return out
+
+# Parse a raw message (String or Bytes) into a Part tree.
+var parse = Function(raw):
+    var s = raw
+    if isinstance(raw, Bytes):
+        s = raw.decode("latin-1")
+    return _parse_entity(s)

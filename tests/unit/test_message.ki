@@ -1,0 +1,97 @@
+# Tests for smtp.address, smtp.message (build), and smtp.msgparse (parse) — including full round-trips.
+var addr = import("smtp.address")
+var msg = import("smtp.message")
+var mp = import("smtp.msgparse")
+var E = import("smtp.errors")
+var t = import("harness").Tester("message")
+
+# --- address parsing / formatting ---
+t.eq("parse name+email", addr.parse_one("John Doe <john@x.com>"), ["John Doe", "john@x.com"])
+t.eq("parse bare", addr.parse_one("bare@x.com"), ["", "bare@x.com"])
+t.eq("parse quoted name", addr.parse_one("\"Doe, John\" <j@x.com>"), ["Doe, John", "j@x.com"])
+t.eq("format plain", addr.format_addr("John Doe", "j@x"), "John Doe <j@x>")
+t.eq("format quoted for comma", addr.format_addr("Doe, John", "j@x"), "\"Doe, John\" <j@x>")
+t.eq("format no name", addr.format_addr("", "a@x"), "a@x")
+t.check("format nonascii encodes", addr.format_addr("Café", "c@x").find("=?utf-8?B?") == 0)
+t.eq("addr_spec", addr.addr_spec("Bob <bob@x.com>"), "bob@x.com")
+var lst = addr.parse_list("a@x, B <b@y>, \"C, D\" <c@z>")
+t.eq("parse_list count", len(lst), 3)
+t.eq("parse_list 3rd name", lst[2][0], "C, D")
+
+t.check("valid ok", addr.is_valid("a@b.com"))
+t.check("valid ip literal", addr.is_valid("a@[1.2.3.4]"))
+t.check("invalid no at", not addr.is_valid("no-at"))
+t.check("invalid no dot", not addr.is_valid("a@b"))
+t.check("invalid space", not addr.is_valid("a b@x.com"))
+t.check("invalid crlf", not addr.is_valid("a@x.com\r\nRCPT"))
+t.check("invalid dotdot", not addr.is_valid("a@b..c"))
+
+# --- text-only round-trip ---
+var m1 = msg.MailBuilder()
+m1.from_("alice@a.com", "Alice").to("bob@b.com").subject("Hello there").text("Line one\nLine two")
+var raw1 = m1.build()
+var p1 = mp.parse(raw1)
+t.eq("text/plain type", p1.content_type, "text/plain")
+t.eq("text body", p1.text(), "Line one\r\nLine two")
+t.eq("From header", p1.header("from"), "Alice <alice@a.com>")
+t.eq("To header", p1.header("to"), "bob@b.com")
+t.eq("Subject header", p1.header("subject"), "Hello there")
+t.check("has Date", p1.header("date") != None)
+t.check("has Message-ID", p1.header("message-id") != None)
+t.check("has MIME-Version", p1.header("mime-version") == "1.0")
+
+# --- text + html -> multipart/alternative ---
+var m2 = msg.MailBuilder().from_("a@a.com").to("b@b.com").subject("Alt")
+m2.text("plain").html("<b>rich</b>")
+var p2 = mp.parse(m2.build())
+t.eq("alternative type", p2.content_type, "multipart/alternative")
+t.eq("alt parts", len(p2.parts), 2)
+t.eq("alt part1 plain", p2.parts[0].content_type, "text/plain")
+t.eq("alt part2 html", p2.parts[1].content_type, "text/html")
+t.eq("alt html body", p2.parts[1].text(), "<b>rich</b>")
+
+# --- attachment -> multipart/mixed ---
+var m3 = msg.MailBuilder().from_("a@a.com").to("b@b.com").subject("Att").text("see attached")
+m3.attach("data.bin", Bytes([1, 2, 3, 4, 255, 0]), "application/octet-stream")
+var p3 = mp.parse(m3.build())
+t.eq("mixed type", p3.content_type, "multipart/mixed")
+t.eq("mixed body first", p3.parts[0].content_type, "text/plain")
+t.eq("attachment type", p3.parts[1].content_type, "application/octet-stream")
+t.eq("attachment bytes roundtrip", p3.parts[1].get_bytes(), Bytes([1, 2, 3, 4, 255, 0]))
+t.eq("attachment filename", p3.parts[1].filename(), "data.bin")
+
+# --- full tree: text + html + inline + attachment ---
+var m4 = msg.MailBuilder().from_("alice@a.com", "Alice").to("bob@b.com", "Bob").cc("carol@c.com")
+m4.subject("Grüße & Hello").text("Plain body\nline2").html("<b>HTML</b> <img src=cid:logo1>")
+m4.attach("report.pdf", Bytes([37, 80, 68, 70]), "application/pdf")
+m4.embed("logo.png", Bytes([137, 80, 78, 71]), "logo1")
+var p4 = mp.parse(m4.build())
+t.eq("full mixed", p4.content_type, "multipart/mixed")
+t.eq("full related", p4.parts[0].content_type, "multipart/related")
+t.eq("full pdf", p4.parts[1].content_type, "application/pdf")
+t.eq("full alternative", p4.parts[0].parts[0].content_type, "multipart/alternative")
+t.eq("full inline png", p4.parts[0].parts[1].content_type, "image/png")
+t.eq("inline Content-ID", p4.parts[0].parts[1].header("content-id"), "<logo1>")
+t.eq("full plain", p4.parts[0].parts[0].parts[0].text(), "Plain body\r\nline2")
+t.eq("full subject decoded", mp.decode_header(p4.header("subject")), "Grüße & Hello")
+t.eq("cc header", p4.header("cc"), "carol@c.com")
+
+# --- envelope helpers ---
+var m5 = msg.MailBuilder().from_("s@x.com").to("a@x.com").to("b@x.com").cc("a@x.com").bcc("hidden@x.com")
+t.eq("recipients deduped", m5.recipients(), ["a@x.com", "b@x.com", "hidden@x.com"])
+t.eq("envelope sender", m5.envelope_sender(), "s@x.com")
+t.check("bcc not in headers", m5.build().find("hidden@x.com") < 0)
+
+# --- non-ASCII display name + body use encoding, round-trip decodes ---
+var m6 = msg.MailBuilder().from_("jose@x.com", "José García").to("b@x.com").subject("x").text("Niño café ☕")
+var p6 = mp.parse(m6.build())
+t.eq("utf8 body roundtrip", p6.text(), "Niño café ☕")
+t.eq("from name decoded", mp.decode_header(p6.header("from")), "José García <jose@x.com>")
+
+# --- header / address injection is blocked ---
+t.raises("subject injection", Function(): return msg.MailBuilder().from_("a@x").to("b@x").subject("Hi\r\nBcc: evil@x").build(), "injection")
+t.raises("address injection", Function(): return msg.MailBuilder().from_("a@x").to("b@x\r\nDATA").subject("x").build(), "injection")
+t.raises("header value injection", Function(): return msg.MailBuilder().from_("a@x").to("b@x").subject("x").header("X-Custom", "ok\r\nInjected: yes").build(), "injection")
+t.raises("bad address no at", Function(): return msg.MailBuilder().from_("a@x").to("noat").subject("x").build(), "addr-spec")
+
+t.done()

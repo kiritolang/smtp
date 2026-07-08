@@ -1,0 +1,6 @@
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var c = C.SmtpClient(transport = T.FakeTransport("220 mx\r\n250 mx\r\n550 5.7.1 Sender rejected\r\n"))
+c.connect()
+c.ehlo()
+discard c.mail("blocked@x.com")

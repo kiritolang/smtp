@@ -1,0 +1,121 @@
+# Tests for smtp.auth — SASL response builders against RFC vectors, plus full exchange flows over the
+# FakeTransport.
+var A = import("smtp.auth")
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var E = import("smtp.errors")
+var base64 = import("base64")
+var t = import("harness").Tester("auth")
+
+var b64dec = Function(s):
+    return Bytes(base64.decode(s)).decode("latin-1")
+
+# --- PLAIN (RFC 4616) ---
+t.eq("plain user/pass", A.plain("user", "pass"), "AHVzZXIAcGFzcw==")
+t.eq("plain test/test", A.plain("test", "test"), "AHRlc3QAdGVzdA==")
+t.eq("plain decodes", b64dec(A.plain("u", "p")), "\x00u\x00p")
+
+# --- CRAM-MD5 (RFC 2195 worked example) ---
+var cram = A.cram_md5("tim", "tanstaaftanstaaf", Bytes("<1896.697170952@postoffice.reston.mci.net>"))
+t.eq("cram-md5 response", b64dec(cram), "tim b913a602c7eda7a495b4e6e7334d3890")
+
+# --- XOAUTH2 / OAUTHBEARER structure ---
+t.eq("xoauth2", b64dec(A.xoauth2("u@e.com", "tok")), "user=u@e.com\x01auth=Bearer tok\x01\x01")
+t.check("oauthbearer has bearer", b64dec(A.oauthbearer("u@e.com", "tok")).find("auth=Bearer tok") >= 0)
+
+# --- EXTERNAL / ANONYMOUS ---
+t.eq("external empty", A.external(""), "=")
+t.eq("external id", b64dec(A.external("admin")), "admin")
+t.eq("anonymous", b64dec(A.anonymous("guest@x")), "guest@x")
+
+# --- SCRAM-SHA-1 (RFC 5802 worked example) ---
+var s1 = A.scram_proof("sha1", "pencil", Bytes(base64.decode("QSXCR+Q6sek8bf92")), 4096,
+    "n=user,r=fyko+d2lbbFgONRv9qkxdawL",
+    "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096",
+    "n,,", "fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j")
+t.check("scram-sha-1 client proof", s1[0].endswith("p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="))
+t.eq("scram-sha-1 server sig", s1[1], "rmF9pqV8S7suAoZWja4dJRkFsKQ=")
+t.check("scram-sha-1 channel binding", s1[0].find("c=biws,r=") == 0)
+
+# --- SCRAM-SHA-256 (RFC 7677 worked example) ---
+var s256 = A.scram_proof("sha256", "pencil", Bytes(base64.decode("W22ZaJ0SNY7soEsUEjb6gQ==")), 4096,
+    "n=user,r=rOprNGfwEbeRWgbNEkqO",
+    "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+    "n,,", "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0")
+t.check("scram-sha-256 client proof", s256[0].endswith("p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="))
+t.eq("scram-sha-256 server sig", s256[1], "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+
+# --- DIGEST-MD5 (RFC 2831 worked example) ---
+t.eq("digest-md5 response", A.digest_md5_response("chris", "secret", "elwood.innosoft.com", "OA6MG9tEQGm2hh", "OA6MHXh6VqTrRk", "00000001", "imap/elwood.innosoft.com", "auth"), "d388dad90d4bbd760a152321f2143af7")
+
+# --- NTLM crypto core (MS-NLMP 4.2.4 vectors) ---
+t.eq("nt hash password", A.nt_hash("password").hex(), "8846f7eaee8fb117ad06bdd830b7586c")
+t.eq("nt hash Password", A.nt_hash("Password").hex(), "a4f49c406510bdcab6824ee7c30fd852")
+t.eq("ntowfv2", A.ntowfv2("User", "Password", "Domain").hex(), "0c868a403bfd7a93a3001ef22ef02e3f")
+
+# --- exchange flows over the fake ---
+var run = Function(script):
+    var f = T.FakeTransport(script)
+    return [C.SmtpClient(transport = f, host = "mx.test"), f]
+
+# PLAIN success
+var cp, fp = run("235 2.7.0 Authentication successful\r\n")
+cp.login("user", "pass", "PLAIN")
+t.check("PLAIN sent", fp.sent.find("AUTH PLAIN AHVzZXIAcGFzcw==\r\n") >= 0)
+
+# LOGIN step-by-step
+var cl, fl = run("334 VXNlcm5hbWU6\r\n334 UGFzc3dvcmQ6\r\n235 2.7.0 OK\r\n")
+cl.login("user", "pass", "LOGIN")
+t.check("LOGIN cmd", fl.sent.find("AUTH LOGIN\r\n") >= 0)
+t.check("LOGIN user b64", fl.sent.find("dXNlcg==\r\n") >= 0)
+t.check("LOGIN pass b64", fl.sent.find("cGFzcw==\r\n") >= 0)
+
+# CRAM-MD5: response decodes to "user <32-hex>"
+var challenge_b64 = base64.encode("<challenge.12345@mx.test>")
+var cc, fc = run("334 " + challenge_b64 + "\r\n235 2.7.0 OK\r\n")
+cc.login("user", "secret", "CRAM-MD5")
+var cram_line = fc.sent.split("AUTH CRAM-MD5\r\n")[1].split("\r\n")[0]
+var decoded_cram = b64dec(cram_line)
+t.check("CRAM-MD5 form", decoded_cram.find("user ") == 0 and len(decoded_cram) == 5 + 32)
+
+# SCRAM-SHA-256 full exchange (RFC 7677 vectors) — validates flow + server-signature verification
+var sf = base64.encode("r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+var svf = base64.encode("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+var cs, fs = run("334 " + sf + "\r\n334 " + svf + "\r\n235 2.7.0 OK\r\n")
+var scram_ok = cs.login("user", "pencil", "SCRAM-SHA-256", {"cnonce": "rOprNGfwEbeRWgbNEkqO"})
+t.eq("SCRAM exchange success", scram_ok.code, 235)
+t.check("SCRAM initial sent", fs.sent.find("AUTH SCRAM-SHA-256 ") >= 0)
+
+# SCRAM detects a forged server signature -> SmtpAuthError
+var bad_svf = base64.encode("v=AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+var cbad, fbad = run("334 " + sf + "\r\n334 " + bad_svf + "\r\n235 OK\r\n")
+t.raises("SCRAM MITM detected", Function(): return cbad.login("user", "pencil", "SCRAM-SHA-256", {"cnonce": "rOprNGfwEbeRWgbNEkqO"}), "server signature")
+
+# auth failure -> SmtpAuthError with the code
+var cf2, ff2 = run("535 5.7.8 Authentication credentials invalid\r\n")
+t.raises("auth failure", Function(): return cf2.login("user", "bad", "PLAIN"), "authentication failed")
+
+# auto-select picks LOGIN when only PLAIN/LOGIN are offered
+var cauto, fauto = run("334 VXNlcm5hbWU6\r\n334 UGFzc3dvcmQ6\r\n235 OK\r\n")
+cauto.esmtp_features = {"AUTH": "PLAIN LOGIN"}
+cauto.login("user", "pass", "auto")
+t.check("auto picked LOGIN", fauto.sent.find("AUTH LOGIN\r\n") >= 0)
+
+# no mutually-supported mechanism
+var cno, fno = run("")
+cno.esmtp_features = {"AUTH": "GSSAPI"}
+t.raises("no shared mech", Function(): return cno.login("u", "p", "auto"), "no mutually supported")
+
+# --- server-side verifiers ---
+var lookup = Function(u):
+    if u == "alice":
+        return "wonderland"
+    return None
+t.eq("verify_plain ok", A.verify_plain(A.plain("alice", "wonderland"), lookup), "alice")
+t.eq("verify_plain bad", A.verify_plain(A.plain("alice", "nope"), lookup), None)
+t.eq("verify_login ok", A.verify_login(base64.encode("alice"), base64.encode("wonderland"), lookup), "alice")
+var chal = Bytes("<srv.chal@mx.test>")
+t.eq("verify_cram ok", A.verify_cram_md5(chal, A.cram_md5("alice", "wonderland", chal), lookup), "alice")
+t.eq("verify_cram bad", A.verify_cram_md5(chal, A.cram_md5("alice", "wrong", chal), lookup), None)
+
+t.done()

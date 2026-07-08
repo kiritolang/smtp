@@ -1,0 +1,5 @@
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var c = C.SmtpClient(transport = T.FakeTransport(""))
+c.esmtp_features = {"AUTH": "GSSAPI KERBEROS_V4"}
+discard c.login("user", "pass", "auto")

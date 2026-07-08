@@ -1,0 +1,108 @@
+# RFC 5321/5322 address handling: parse "Display Name <local@domain>" forms, format addresses (with
+# RFC 2047 display-name encoding and quoting), split address lists, and validate an addr-spec. Used by
+# the message builder (header formatting) and callers extracting envelope addresses.
+
+var mime = import("smtp.mime")
+
+var _SPECIALS = "()<>[]:;@\\\",."
+
+var _needs_quoting = Function(name):
+    if len(name) == 0:
+        return False
+    for c in name:
+        if _SPECIALS.find(c) >= 0:
+            return True
+    return False
+
+var _unquote = Function(s):
+    var str = s.strip()
+    if len(str) >= 2 and str[0:1] == "\"" and str[len(str) - 1:] == "\"":
+        var inner = str[1:len(str) - 1]
+        return inner.replace("\\\"", "\"").replace("\\\\", "\\")
+    return str
+
+# Parse a single address into [display_name, addr_spec]. "a@b" -> ["", "a@b"].
+var parse_one = Function(s):
+    var str = s.strip()
+    var lt = str.rfind("<")
+    var gt = str.rfind(">")
+    if lt >= 0 and gt > lt:
+        return [_unquote(str[0:lt].strip()), str[lt + 1:gt].strip()]
+    return ["", str]
+
+# Format [name,]email as a header address. The display name is RFC 2047-encoded if non-ASCII, quoted if
+# it contains specials, and omitted if empty.
+var format_addr = Function(name, email):
+    if name == None or len(name) == 0:
+        return email
+    var display = name
+    if not mime.is_ascii(name) or mime.has_ctrl(name):
+        display = mime.encode_header_value(name)
+    elif _needs_quoting(name):
+        display = "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+    return display + " <" + email + ">"
+
+# Split a comma-separated address list into [[name,email], ...], respecting quotes and angle brackets.
+var parse_list = Function(s):
+    var out = []
+    var depth = 0
+    var inq = False
+    var cur = ""
+    var i = 0
+    var n = len(s)
+    while i < n:
+        var c = s[i:i + 1]
+        if inq:
+            if c == "\\" and i + 1 < n:
+                cur = cur + c + s[i + 1:i + 2]
+                i = i + 2
+                continue
+            if c == "\"":
+                inq = False
+            cur = cur + c
+        elif c == "\"":
+            inq = True
+            cur = cur + c
+        elif c == "<":
+            depth = depth + 1
+            cur = cur + c
+        elif c == ">":
+            if depth > 0:
+                depth = depth - 1
+            cur = cur + c
+        elif c == "," and depth == 0:
+            if len(cur.strip()) > 0:
+                out.append(parse_one(cur))
+            cur = ""
+        else:
+            cur = cur + c
+        i = i + 1
+    if len(cur.strip()) > 0:
+        out.append(parse_one(cur))
+    return out
+
+# The bare addr-spec from a (possibly display-name-decorated) address string.
+var addr_spec = Function(s):
+    return parse_one(s)[1]
+
+# A conservative RFC 5321 addr-spec check: local@domain, no CR/LF/space, a dotted domain or a bracketed
+# address literal. Good enough to catch typos and injection, not a full grammar.
+var is_valid = Function(email):
+    if email.find("\r") >= 0 or email.find("\n") >= 0 or email.find(" ") >= 0 or email.find("\x00") >= 0:
+        return False
+    var at = email.rfind("@")
+    if at <= 0 or at >= len(email) - 1:
+        return False
+    var local = email[0:at]
+    var domain = email[at + 1:]
+    if len(local) == 0 or len(local) > 64:
+        return False
+    if domain.find("..") >= 0:
+        return False
+    if domain[0:1] == "[" and domain[len(domain) - 1:] == "]":
+        return True
+    if domain[0:1] == "." or domain[len(domain) - 1:] == ".":
+        return False
+    if domain.find(".") < 0:
+        return False
+    return True

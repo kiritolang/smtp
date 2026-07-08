@@ -1,0 +1,2 @@
+var smtp = import("smtp")
+discard smtp.MailBuilder().from_("a@x.com").to("b@x.com").subject("Hi\r\nBcc: evil@x.com").build()

@@ -1,0 +1,190 @@
+# Property-based / fuzz tests. A fixed seed keeps CI deterministic and reproducible (override with an
+# argument); the seed is printed so any failure can be replayed. Properties asserted:
+#   * base64 / quoted-printable are exact round-trips on random data
+#   * the client surfaces ONLY typed SmtpError (never a native crash) on random/malformed reply streams
+#   * the address and message parsers never crash on arbitrary input
+#   * built messages parse cleanly and keep every line within RFC limits
+var random = import("random")
+var io = import("io")
+var M = import("smtp.mime")
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var E = import("smtp.errors")
+var addr = import("smtp.address")
+var msg = import("smtp.message")
+var mp = import("smtp.msgparse")
+var t = import("harness").Tester("fuzz")
+
+var seed = 20250708
+if len(arglist) >= 1:
+    seed = Integer(arglist[0])
+io.print("fuzz seed:", seed)
+var rng = random.Random(seed)
+
+var rint = Function(a, b):
+    return rng.randint(a, b)
+
+var rbytes = Function(n):
+    var b = []
+    var i = 0
+    while i < n:
+        b.append(rint(0, 255))
+        i = i + 1
+    return Bytes(b)
+
+# random printable-ASCII text (includes @ < > , " : and other specials, never CR/LF)
+var rprint = Function(n):
+    var s = ""
+    var i = 0
+    while i < n:
+        s = s + chr(rint(32, 126))
+        i = i + 1
+    return s
+
+# --- 1. base64 exact round-trip over random binary ---
+var b64_ok = True
+var i = 0
+while i < 400:
+    var b = rbytes(rint(0, 120))
+    if M.b64_decode_body(M.b64_body(b)) != b:
+        b64_ok = False
+    i = i + 1
+t.check("base64 exact round-trip over 400 random blobs", b64_ok)
+
+# --- 2. quoted-printable round-trip over random Unicode text ---
+var qp_ok = True
+i = 0
+while i < 300:
+    var s = ""
+    var k = 0
+    var m = rint(0, 40)
+    while k < m:
+        var cp = rint(1, 0x2000)
+        if cp < 0xD800 or cp > 0xDFFF:
+            s = s + chr(cp)
+        k = k + 1
+    var expect = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    if M.qp_decode(M.qp_encode(s)).decode("utf-8") != expect:
+        qp_ok = False
+    i = i + 1
+t.check("QP round-trip over 300 random Unicode strings", qp_ok)
+
+# --- 3. client throws ONLY SmtpError on random/malformed reply streams ---
+var rand_line = Function():
+    var choice = rint(0, 5)
+    if choice == 0:
+        return String(rint(100, 599)) + " " + rprint(rint(0, 15)) + "\r\n"
+    if choice == 1:
+        return String(rint(100, 599)) + "-" + rprint(rint(0, 10)) + "\r\n"
+    if choice == 2:
+        return rprint(rint(0, 25)) + "\r\n"
+    if choice == 3:
+        return rprint(rint(1, 10))
+    if choice == 4:
+        return String(rint(100, 599)) + " ok\n"
+    return "\r\n"
+
+var client_ok = True
+i = 0
+while i < 300:
+    var stream = ""
+    var lines = rint(0, 10)
+    var k = 0
+    while k < lines:
+        stream = stream + rand_line()
+        k = k + 1
+    try:
+        var c = C.SmtpClient(transport = T.FakeTransport(stream), host = "mx", local_hostname = "cli")
+        c.connect()
+        c.ehlo()
+        c.sendmail("a@x.com", ["b@y.com"], "Subject: x\r\n\r\nbody\r\n")
+        c.quit()
+    catch E.SmtpError as e:
+        discard e
+    catch as e:
+        io.print("LEAKED non-SmtpError:", String(e))
+        client_ok = False
+    i = i + 1
+t.check("client throws only SmtpError over 300 random reply streams", client_ok)
+
+# --- 4. address parsing never crashes ---
+var addr_ok = True
+i = 0
+while i < 400:
+    var s = rprint(rint(0, 30))
+    try:
+        discard addr.is_valid(s)
+        discard addr.parse_one(s)
+        discard addr.parse_list(s)
+        discard addr.addr_spec(s)
+    catch as e:
+        io.print("addr crash on:", s, String(e))
+        addr_ok = False
+    i = i + 1
+t.check("address parsing never crashes on random input", addr_ok)
+
+# --- 5. message parser never crashes on arbitrary input ---
+var parse_ok = True
+i = 0
+while i < 250:
+    var raw = ""
+    var lines = rint(0, 15)
+    var k = 0
+    while k < lines:
+        raw = raw + rprint(rint(0, 40)) + "\r\n"
+        k = k + 1
+    try:
+        var p = mp.parse(raw)
+        discard p.text()
+        discard p.walk_leaves()
+    catch as e:
+        io.print("msgparse crash:", String(e))
+        parse_ok = False
+    i = i + 1
+t.check("msgparse never crashes on random input", parse_ok)
+
+# --- 6. random built messages parse cleanly and respect line limits ---
+var rand_email = Function():
+    return rprint2(rint(1, 8)) + "@" + rprint2(rint(1, 6)) + ".com"
+var rprint2 = Function(n):
+    var abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+    var s = ""
+    var i2 = 0
+    while i2 < n:
+        s = s + abc[rint(0, len(abc) - 1)]
+        i2 = i2 + 1
+    return s
+var rand_name = Function(n):
+    var s = ""
+    var i2 = 0
+    while i2 < n:
+        var cp = rint(32, 0x400)
+        if (cp != 13 and cp != 10 and cp != 0) and (cp < 0xD800 or cp > 0xDFFF):
+            s = s + chr(cp)
+        i2 = i2 + 1
+    return s
+
+var build_ok = True
+i = 0
+while i < 200:
+    var mb = msg.MailBuilder().from_(rand_email(), rand_name(rint(0, 12)))
+    var nrcpt = rint(1, 4)
+    var r = 0
+    while r < nrcpt:
+        mb.to(rand_email(), rand_name(rint(0, 8)))
+        r = r + 1
+    mb.subject(rand_name(rint(0, 60))).text(rand_name(rint(0, 200)))
+    try:
+        var raw = mb.build()
+        for line in raw.split("\r\n"):
+            if len(line.encode("utf-8")) > 998:
+                io.print("LINE TOO LONG:", len(line))
+                build_ok = False
+        discard mp.parse(raw)
+    catch as e:
+        io.print("build/parse crash:", String(e))
+        build_ok = False
+    i = i + 1
+t.check("random messages build+parse cleanly, all lines <=998 octets", build_ok)
+
+t.done()

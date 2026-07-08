@@ -1,0 +1,96 @@
+# SMTP exception hierarchy. Every failure the library raises is an instance of `SmtpError` (or a
+# subclass), so a caller can catch the whole family with `catch smtp.errors.SmtpError as e` — typed
+# catch matches subclasses through the class chain. Public library code NEVER lets a bare String or a
+# native runtime error escape; it wraps into one of these.
+
+# Base of the hierarchy. `code` is the 3-digit SMTP reply code (Integer) when one applies, else None;
+# `esc` is the RFC 3463 enhanced status code ("X.Y.Z" String) when the server sent one, else None.
+class SmtpError:
+    var _init_ = Function(self, message, code = None, esc = None):
+        self.message = message
+        self.code = code
+        self.esc = esc
+
+    var _str_ = Function(self):
+        var head = self.name()
+        if self.code != None:
+            head = head + " " + String(self.code)
+            if self.esc != None:
+                head = head + " (" + self.esc + ")"
+        return head + ": " + self.message
+
+    # Subclasses override so diagnostics name the concrete error; base default is the family name.
+    var name = Function(self):
+        return "SmtpError"
+
+# Could not open (or keep) the transport: DNS/connect failure, TLS build missing, socket dead on arrival.
+class SmtpConnectError(SmtpError):
+    var _init_ = Function(self, message):
+        self._super_()._init_(message)
+    var name = Function(self):
+        return "SmtpConnectError"
+
+# The peer closed the connection unexpectedly (EOF where a reply was due).
+class SmtpServerDisconnected(SmtpError):
+    var _init_ = Function(self, message):
+        self._super_()._init_(message)
+    var name = Function(self):
+        return "SmtpServerDisconnected"
+
+# A blocking operation exceeded its timeout.
+class SmtpTimeout(SmtpError):
+    var _init_ = Function(self, message):
+        self._super_()._init_(message)
+    var name = Function(self):
+        return "SmtpTimeout"
+
+# A TLS/STARTTLS step failed or was refused (or the build lacks TLS).
+class SmtpTlsError(SmtpError):
+    var _init_ = Function(self, message, code = None, esc = None):
+        self._super_()._init_(message, code, esc)
+    var name = Function(self):
+        return "SmtpTlsError"
+
+# AUTH failed: bad credentials, an unsupported/unoffered mechanism, or a malformed challenge.
+class SmtpAuthError(SmtpError):
+    var _init_ = Function(self, message, code = None, esc = None):
+        self._super_()._init_(message, code, esc)
+    var name = Function(self):
+        return "SmtpAuthError"
+
+# A command drew an unexpected reply code. Carries the code, enhanced code, and the server's text.
+class SmtpResponseError(SmtpError):
+    var _init_ = Function(self, code, message, esc = None):
+        self._super_()._init_(message, code, esc)
+    var name = Function(self):
+        return "SmtpResponseError"
+
+# EHLO/HELO was rejected.
+class SmtpHeloError(SmtpResponseError):
+    var _init_ = Function(self, code, message, esc = None):
+        self._super_()._init_(code, message, esc)
+    var name = Function(self):
+        return "SmtpHeloError"
+
+# The server refused the envelope sender (MAIL FROM).
+class SmtpSenderRefused(SmtpResponseError):
+    var _init_ = Function(self, code, message, sender, esc = None):
+        self._super_()._init_(code, message, esc)
+        self.sender = sender
+    var name = Function(self):
+        return "SmtpSenderRefused"
+
+# Every recipient was refused. `refused` maps each address -> [code, esc_or_None, text].
+class SmtpRecipientsRefused(SmtpError):
+    var _init_ = Function(self, refused):
+        self._super_()._init_("all recipients refused")
+        self.refused = refused
+    var name = Function(self):
+        return "SmtpRecipientsRefused"
+
+# DATA (or BDAT) content was refused, or the message could not be encoded/validated.
+class SmtpDataError(SmtpError):
+    var _init_ = Function(self, message, code = None, esc = None):
+        self._super_()._init_(message, code, esc)
+    var name = Function(self):
+        return "SmtpDataError"

@@ -1,0 +1,71 @@
+# HMAC (RFC 2104) and PBKDF2 (RFC 2898) in pure Kirito, built on the native `hash` module. The stdlib
+# has no HMAC, so SASL's CRAM-MD5 / DIGEST-MD5 / SCRAM mechanisms need this. The native digests return
+# hex, so `fromhex` recovers the raw digest bytes for the ipad/opad construction.
+
+var hash = import("hash")
+var bu = import("smtp.bytesutil")
+
+# md5/sha1/sha256 all use a 64-byte block; digest sizes are 16/20/32.
+var _BLOCK = 64
+
+# hashfn: a function Bytes|String -> lowercase hex String (hash.md5 / hash.sha1 / hash.sha256).
+# key, msg: Bytes. Returns the raw HMAC digest as Bytes.
+var _hmac = Function(hashfn, key, msg):
+    var kb = key
+    if len(kb) > _BLOCK:
+        kb = fromhex(hashfn(kb))
+    var kpad = bu.to_list(kb)
+    while len(kpad) < _BLOCK:
+        kpad.append(0)
+    var ipad = []
+    var opad = []
+    var i = 0
+    while i < _BLOCK:
+        ipad.append(bitxor(kpad[i], 0x36))
+        opad.append(bitxor(kpad[i], 0x5c))
+        i = i + 1
+    var inner = fromhex(hashfn(Bytes(ipad) + msg))
+    return fromhex(hashfn(Bytes(opad) + inner))
+
+var hmac_md5 = Function(key, msg):
+    return _hmac(hash.md5, bu.as_bytes(key), bu.as_bytes(msg))
+
+var hmac_sha1 = Function(key, msg):
+    return _hmac(hash.sha1, bu.as_bytes(key), bu.as_bytes(msg))
+
+var hmac_sha256 = Function(key, msg):
+    return _hmac(hash.sha256, bu.as_bytes(key), bu.as_bytes(msg))
+
+# Hex-digest convenience wrappers.
+var hmac_md5_hex = Function(key, msg):
+    return hmac_md5(key, msg).hex()
+
+var hmac_sha1_hex = Function(key, msg):
+    return hmac_sha1(key, msg).hex()
+
+var hmac_sha256_hex = Function(key, msg):
+    return hmac_sha256(key, msg).hex()
+
+# PBKDF2 (RFC 2898). `prf` is one of the hmac_* functions above (key, msg) -> Bytes. Returns `dklen`
+# derived Bytes. Supports dklen > digest size via multiple blocks. Used by SCRAM (dklen = digest size).
+var pbkdf2 = Function(prf, password, salt, iterations, dklen):
+    var pw = bu.as_bytes(password)
+    var s = bu.as_bytes(salt)
+    var out = []
+    var block = 1
+    while len(out) < dklen:
+        var u = prf(pw, s + bu.u32_be(block))
+        var acc = bu.to_list(u)
+        var i = 1
+        while i < iterations:
+            u = prf(pw, u)
+            var ul = bu.to_list(u)
+            var k = 0
+            while k < len(acc):
+                acc[k] = bitxor(acc[k], ul[k])
+                k = k + 1
+            i = i + 1
+        for b in acc:
+            out.append(b)
+        block = block + 1
+    return Bytes(out[0:dklen])

@@ -1,0 +1,150 @@
+# Unit tests for smtp.client's core state machine, driven entirely by scripted FakeTransports.
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var E = import("smtp.errors")
+var t = import("harness").Tester("client_core")
+
+# Build a client wired to a scripted fake; return [client, fake] so the test can inspect fake.sent.
+var pair = Function(script):
+    var f = T.FakeTransport(script)
+    var c = C.SmtpClient(host = "mx.test", transport = f, local_hostname = "client.local")
+    return [c, f]
+
+# --- happy path: connect, EHLO capabilities, full sendmail, quit ---
+var script1 = "".join([
+    "220 mx.test ESMTP ready\r\n",
+    "250-mx.test\r\n250-SIZE 1000000\r\n250-8BITMIME\r\n250-AUTH PLAIN LOGIN\r\n250 STARTTLS\r\n",
+    "250 2.1.0 Ok\r\n",
+    "250 2.1.5 Ok\r\n",
+    "354 End data with <CR><LF>.<CR><LF>\r\n",
+    "250 2.0.0 Ok: queued as ABC\r\n",
+    "221 2.0.0 Bye\r\n"
+])
+var c1, f1 = pair(script1)
+c1.connect()
+t.check("greeting captured", c1.greeting.find("ESMTP ready") >= 0)
+c1.ehlo()
+t.check("does_esmtp", c1.does_esmtp)
+t.check("has SIZE", c1.has_extension("SIZE"))
+t.eq("SIZE param", c1.extension_param("SIZE"), "1000000")
+t.check("has 8BITMIME (case-insensitive)", c1.has_extension("8bitmime"))
+t.check("has STARTTLS", c1.has_extension("STARTTLS"))
+t.eq("auth mechs", c1.supports_auth(), ["PLAIN", "LOGIN"])
+var refused = c1.sendmail("alice@a.com", ["bob@b.com"], "Subject: hi\r\n\r\nBody line\r\n.leading dot line\r\n")
+t.eq("no refusals", refused, {})
+c1.quit()
+t.check("sent EHLO", f1.sent.find("EHLO client.local\r\n") >= 0)
+t.check("sent MAIL", f1.sent.find("MAIL FROM:<alice@a.com>\r\n") >= 0)
+t.check("sent RCPT", f1.sent.find("RCPT TO:<bob@b.com>\r\n") >= 0)
+t.check("sent DATA", f1.sent.find("DATA\r\n") >= 0)
+t.check("dot-stuffed", f1.sent.find("\r\n..leading dot line\r\n") >= 0)
+t.check("data terminator", f1.sent.find("\r\n.\r\n") >= 0)
+t.check("sent QUIT", f1.sent.find("QUIT\r\n") >= 0)
+
+# --- HELO fallback when EHLO is not implemented ---
+var c2, f2 = pair("220 old.test\r\n502 5.5.1 Command not implemented\r\n250 old.test Hello\r\n")
+c2.connect()
+c2.ehlo_or_helo()
+t.check("fell back to HELO", not c2.does_esmtp)
+t.check("HELO sent", f2.sent.find("HELO client.local\r\n") >= 0)
+
+# --- greeting failure -> SmtpConnectError ---
+var c3, f3 = pair("554 no service here\r\n")
+t.raises("bad greeting", Function(): return c3.connect(), "554")
+
+# --- sender refused -> SmtpSenderRefused carrying .sender ---
+var c4, f4 = pair("220 mx\r\n250 mx\r\n550 5.7.1 Sender address rejected\r\n")
+c4.connect()
+c4.ehlo()
+var sender_type_ok = False
+try:
+    c4.mail("blocked@x.com")
+catch E.SmtpSenderRefused as e:
+    sender_type_ok = (e.sender == "blocked@x.com" and e.code == 550 and e.esc == "5.7.1")
+t.check("SmtpSenderRefused typed + fields", sender_type_ok)
+
+# --- all recipients refused -> SmtpRecipientsRefused, RSET issued, DATA not sent ---
+var c5, f5 = pair("220 mx\r\n250 mx\r\n250 2.1.0 Ok\r\n550 5.1.1 No such user\r\n250 2.0.0 reset\r\n")
+c5.connect()
+c5.ehlo()
+var recip_ok = False
+try:
+    c5.sendmail("a@a.com", ["ghost@x.com"], "Subject: x\r\n\r\nbody\r\n")
+catch E.SmtpRecipientsRefused as e:
+    recip_ok = ("ghost@x.com" in e.refused)
+t.check("SmtpRecipientsRefused typed + .refused", recip_ok)
+t.check("RSET issued after total refusal", f5.sent.find("RSET\r\n") >= 0)
+t.check("DATA not sent after total refusal", f5.sent.find("DATA\r\n") < 0)
+
+# --- partial refusal: refused dict returned, DATA still delivered ---
+var c6, f6 = pair("220 mx\r\n250 mx\r\n250 Ok\r\n250 Ok\r\n550 5.1.1 nope\r\n354 go\r\n250 queued\r\n")
+c6.connect()
+c6.ehlo()
+var part = c6.sendmail("a@a.com", ["good@x.com", "bad@y.com"], "Subject: x\r\n\r\nbody\r\n")
+t.check("partial refusal recorded", "bad@y.com" in part and not ("good@x.com" in part))
+t.check("DATA still sent on partial", f6.sent.find("DATA\r\n") >= 0)
+
+# --- DATA content refused -> SmtpDataError ---
+var c7, f7 = pair("220 mx\r\n250 mx\r\n250 Ok\r\n250 Ok\r\n354 go\r\n552 5.3.4 Message too big\r\n")
+c7.connect()
+c7.ehlo()
+t.raises("data refused", Function(): return c7.sendmail("a@a.com", ["b@b.com"], "Subject: x\r\n\r\nbody\r\n"), "Message too big")
+
+# --- mid-dialog disconnect -> SmtpServerDisconnected ---
+var c8, f8 = pair("220 mx\r\n250 mx\r\n")
+c8.connect()
+c8.ehlo()
+t.raises("disconnect", Function(): return c8.mail("a@a.com"), "closed by server")
+
+# --- malformed reply -> SmtpResponseError ---
+var c9, f9 = pair("220 mx\r\nbanana not a reply\r\n")
+c9.connect()
+t.raises("malformed reply", Function(): return c9.ehlo(), "malformed")
+
+# --- multi-line reply with a changing code -> rejected ---
+var c10, f10 = pair("220 mx\r\n250-first line\r\n251 second differs\r\n")
+c10.connect()
+t.raises("code changed mid-reply", Function(): return c10.ehlo(), "changed within")
+
+# --- command injection guard on addresses ---
+var c11, f11 = pair("220 mx\r\n250 mx\r\n")
+c11.connect()
+c11.ehlo()
+t.raises("CRLF in sender", Function(): return c11.mail("a@b\r\nRCPT TO:<evil@x>"), "command injection")
+t.raises("CRLF in recipient", Function(): return c11.rcpt("v@x\r\nDATA"), "command injection")
+t.check("nothing injected was sent", f11.sent.find("evil@x") < 0)
+
+# --- STARTTLS negotiation flow against the fake (simulated upgrade + re-EHLO) ---
+var c12, f12 = pair("220 mx\r\n250-mx\r\n250 STARTTLS\r\n220 2.0.0 Ready to start TLS\r\n250-mx\r\n250 AUTH PLAIN\r\n")
+c12.connect()
+c12.ehlo()
+t.check("not tls before", not c12.is_tls())
+c12.starttls(verify = False)
+t.check("tls after starttls", c12.is_tls())
+t.check("cipher nonempty", len(c12.cipher()) > 0)
+t.check("STARTTLS sent", f12.sent.find("STARTTLS\r\n") >= 0)
+var ehlo_count = len(f12.sent.split("EHLO ")) - 1
+t.eq("re-EHLO after TLS (two EHLOs)", ehlo_count, 2)
+t.check("AUTH visible only after TLS", c12.has_extension("AUTH"))
+
+# --- STARTTLS refused when not advertised ---
+var c13, f13 = pair("220 mx\r\n250 mx\r\n")
+c13.connect()
+c13.ehlo()
+t.raises("no STARTTLS advertised", Function(): return c13.starttls(verify = False), "does not advertise")
+
+# --- with-context calls quit on exit ---
+var fake14 = T.FakeTransport("220 mx\r\n221 bye\r\n")
+with C.SmtpClient(transport = fake14) as c14:
+    c14.connect()
+t.check("quit sent on context exit", fake14.sent.find("QUIT\r\n") >= 0)
+
+# --- NOOP / RSET / VRFY housekeeping ---
+var c15, f15 = pair("220 mx\r\n250 mx\r\n250 2.0.0 Ok\r\n250 2.0.0 reset\r\n252 2.1.5 send some mail\r\n")
+c15.connect()
+c15.ehlo()
+t.eq("noop 250", c15.noop().code, 250)
+t.eq("rset 250", c15.rset().code, 250)
+t.eq("vrfy 252", c15.vrfy("postmaster").code, 252)
+
+t.done()

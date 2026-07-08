@@ -1,0 +1,381 @@
+# SmtpClient — the ESMTP client state machine: connect, greeting, EHLO/HELO with capability parsing,
+# STARTTLS, AUTH, the MAIL/RCPT/DATA (or BDAT) transaction, and the housekeeping commands. It speaks
+# to a transport (smtp.transport) so the same logic runs over a real socket or a scripted FakeTransport.
+# TLS and SASL live in their own modules but are wired in here.
+
+var errors = import("smtp.errors")
+var parse = import("smtp.parse")
+var tport = import("smtp.transport")
+var net = import("net")
+
+# --- helpers (module-private) --------------------------------------------------------------------
+
+# Reject a CR/LF/NUL in any value that becomes part of a command line: an injected newline would let a
+# caller smuggle extra SMTP commands (SMTP command injection). Security-critical.
+var _check_arg = Function(s, what):
+    if s.find("\r") >= 0 or s.find("\n") >= 0 or s.find("\x00") >= 0:
+        throw errors.SmtpError(what + " contains a control character (CR/LF/NUL) — possible command injection")
+    return s
+
+var _verb = Function(cmd):
+    var sp = cmd.find(" ")
+    if sp < 0:
+        return cmd
+    return cmd[0:sp]
+
+# Normalize any line endings to CRLF (handles LF, CRLF, and lone CR).
+var to_crlf = Function(s):
+    return s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+# Prepare a message for the DATA command: CRLF line endings, dot-stuffing (a leading '.' on any line is
+# doubled), and the terminating "\r\n.\r\n".
+var prep_data = Function(message):
+    var s = to_crlf(message)
+    if not s.endswith("\r\n"):
+        s = s + "\r\n"
+    s = s.replace("\r\n.", "\r\n..")
+    if s[0:1] == ".":
+        s = "." + s
+    return s + ".\r\n"
+
+# A parsed multi-line reply.
+class Reply:
+    var _init_ = Function(self, code, esc, lines):
+        self.code = code          # Integer final reply code
+        self.esc = esc            # enhanced status code (String) from the final line, or None
+        self.lines = lines        # list of the text portion of each reply line
+
+    var text = Function(self):
+        return "\n".join(self.lines)
+
+    # 2xx completion / 3xx intermediate are non-error; 4xx/5xx are failures.
+    var ok = Function(self):
+        var cls = self.code // 100
+        return cls == 2 or cls == 3
+
+# --- the client ----------------------------------------------------------------------------------
+
+class SmtpClient:
+    # `transport` injects a test double (FakeTransport); left None, a real PlainTransport is built on
+    # connect(). `local_hostname` is the EHLO/HELO argument (defaults to the OS hostname).
+    var _init_ = Function(self, host = "localhost", port = 587, timeout = 30, transport = None, local_hostname = None, debug = False):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._t = transport
+        self.local_hostname = local_hostname
+        self.debug = debug
+        self.esmtp_features = {}
+        self.does_esmtp = False
+        self.greeting = ""
+        self.last_reply = None
+        self._closed = False
+
+    # --- low-level dialog ---
+
+    var _log = Function(self, direction, line):
+        if self.debug:
+            import("io").eprint(direction + ": " + line)
+
+    var _getreply = Function(self):
+        var lines = []
+        var code = None
+        var esc = None
+        var first = None
+        while True:
+            var line = self._t.read_line()
+            if line == None:
+                throw errors.SmtpServerDisconnected("connection closed by server while awaiting a reply")
+            self._log("S", line)
+            var pr = parse.parse_reply_line(line)
+            if first == None:
+                first = pr["code"]
+            elif pr["code"] != first:
+                throw errors.SmtpResponseError(pr["code"], "reply code changed within a multi-line reply (" + String(first) + " then " + String(pr["code"]) + ")")
+            lines.append(pr["text"])
+            code = pr["code"]
+            esc = pr["esc"]
+            if not pr["cont"]:
+                break
+        var reply = Reply(code, esc, lines)
+        self.last_reply = reply
+        return reply
+
+    var _send = Function(self, s):
+        self._log("C", s)
+        self._t.write(s + "\r\n")
+
+    # Send a command and read its reply. `expect` is a list of acceptable codes, or None to return the
+    # reply unchecked for the caller to inspect.
+    var _docmd = Function(self, cmd, expect):
+        self._send(cmd)
+        var reply = self._getreply()
+        if expect != None and not (reply.code in expect):
+            throw errors.SmtpResponseError(reply.code, _verb(cmd) + " failed: " + reply.text(), reply.esc)
+        return reply
+
+    # --- connection lifecycle ---
+
+    var connect = Function(self):
+        if self._t == None:
+            self._t = tport.PlainTransport(self.host, self.port, self.timeout)
+        self._t.connect()
+        var reply = self._getreply()
+        if reply.code // 100 != 2:
+            self.close()
+            throw errors.SmtpConnectError("server greeting was " + String(reply.code) + " " + reply.text())
+        self.greeting = reply.text()
+        return reply
+
+    # For implicit TLS (SMTPS): open, upgrade before the greeting, then read the (encrypted) greeting.
+    var connect_tls = Function(self, server_hostname = None, verify = True):
+        if self._t == None:
+            self._t = tport.PlainTransport(self.host, self.port, self.timeout)
+        self._t.connect()
+        self._t.starttls(server_hostname = server_hostname, verify = verify)
+        var reply = self._getreply()
+        if reply.code // 100 != 2:
+            self.close()
+            throw errors.SmtpConnectError("server greeting was " + String(reply.code) + " " + reply.text())
+        self.greeting = reply.text()
+        return reply
+
+    var _ehlo_name = Function(self, name):
+        if name != None:
+            return _check_arg(name, "EHLO name")
+        if self.local_hostname != None:
+            return _check_arg(self.local_hostname, "EHLO name")
+        var h = ""
+        try:
+            h = net.gethostname()
+        catch as e:
+            discard e
+        if h == None or len(h) == 0:
+            return "localhost"
+        return h
+
+    var ehlo = Function(self, name = None):
+        var host = self._ehlo_name(name)
+        var reply = self._docmd("EHLO " + host, None)
+        if reply.code // 100 != 2:
+            throw errors.SmtpHeloError(reply.code, "EHLO refused: " + reply.text(), reply.esc)
+        var parsed = parse.parse_ehlo(reply.lines)
+        self.greeting = parsed["greeting"]
+        self.esmtp_features = parsed["ext"]
+        self.does_esmtp = True
+        return reply
+
+    var helo = Function(self, name = None):
+        var host = self._ehlo_name(name)
+        var reply = self._docmd("HELO " + host, None)
+        if reply.code // 100 != 2:
+            throw errors.SmtpHeloError(reply.code, "HELO refused: " + reply.text(), reply.esc)
+        self.greeting = reply.text()
+        self.esmtp_features = {}
+        self.does_esmtp = False
+        return reply
+
+    # Try EHLO; on a 500/501/502 (server doesn't understand ESMTP) fall back to HELO.
+    var ehlo_or_helo = Function(self, name = None):
+        try:
+            return self.ehlo(name)
+        catch errors.SmtpHeloError as e:
+            if e.code == 500 or e.code == 501 or e.code == 502:
+                return self.helo(name)
+            throw e
+
+    # --- capability queries ---
+
+    var has_extension = Function(self, name):
+        return name.upper() in self.esmtp_features
+
+    var extension_param = Function(self, name):
+        return self.esmtp_features.get(name.upper(), None)
+
+    var supports_auth = Function(self):
+        return parse.auth_mechanisms(self.esmtp_features)
+
+    # --- TLS ---
+
+    # STARTTLS: negotiate an in-place upgrade of the live connection, then re-issue EHLO (mandatory —
+    # the capability list is renegotiated inside TLS, RFC 3207).
+    var starttls = Function(self, server_hostname = None, verify = True, name = None):
+        if not self.has_extension("STARTTLS"):
+            throw errors.SmtpTlsError("server does not advertise STARTTLS")
+        var reply = self._docmd("STARTTLS", None)
+        if reply.code != 220:
+            throw errors.SmtpTlsError("STARTTLS refused: " + String(reply.code) + " " + reply.text(), reply.code, reply.esc)
+        self._t.starttls(server_hostname = server_hostname, verify = verify)
+        # Renegotiate capabilities inside the encrypted channel.
+        self.ehlo(name)
+        return reply
+
+    var is_tls = Function(self):
+        if self._t == None:
+            return False
+        return self._t.is_tls()
+
+    var cipher = Function(self):
+        if self._t == None:
+            return ""
+        return self._t.cipher()
+
+    # --- authentication (delegates mechanism math to smtp.auth) ---
+
+    var login = Function(self, username, password, mechanism = "auto", options = None):
+        # Lazy import so the core client loads without the auth module (and its crypto) present.
+        return import("smtp.auth").authenticate(self, username, password, mechanism, options)
+
+    # Send one AUTH exchange step and return the raw reply (used by smtp.auth). `line` is already the
+    # full command/continuation text; never logged verbatim when it may carry a secret.
+    var auth_command = Function(self, line, secret = False):
+        if secret:
+            self._log("C", "<auth data>")
+            self._t.write(line + "\r\n")
+            return self._getreply()
+        return self._docmd(line, None)
+
+    # --- mail transaction ---
+
+    var mail = Function(self, sender, options = None):
+        _check_arg(sender, "sender address")
+        var cmd = "MAIL FROM:<" + sender + ">"
+        if options != None:
+            for o in options:
+                cmd = cmd + " " + o
+        var reply = self._docmd(cmd, None)
+        if reply.code != 250:
+            throw errors.SmtpSenderRefused(reply.code, reply.text(), sender, reply.esc)
+        return reply
+
+    var rcpt = Function(self, recipient, options = None):
+        _check_arg(recipient, "recipient address")
+        var cmd = "RCPT TO:<" + recipient + ">"
+        if options != None:
+            for o in options:
+                cmd = cmd + " " + o
+        return self._docmd(cmd, None)
+
+    var data = Function(self, message):
+        var reply = self._docmd("DATA", None)
+        if reply.code != 354:
+            throw errors.SmtpDataError("DATA command rejected: " + String(reply.code) + " " + reply.text(), reply.code, reply.esc)
+        self._t.write(prep_data(message))
+        var final = self._getreply()
+        if final.code != 250:
+            throw errors.SmtpDataError("message content rejected: " + String(final.code) + " " + final.text(), final.code, final.esc)
+        return final
+
+    # CHUNKING (RFC 3030): send the message as a single BDAT LAST chunk (no dot-stuffing, exact byte
+    # count). Requires the server to advertise CHUNKING.
+    var data_bdat = Function(self, message):
+        var payload = to_crlf(message).encode("utf-8")
+        self._t.write("BDAT " + String(len(payload)) + " LAST\r\n")
+        self._t.write(payload)
+        var final = self._getreply()
+        if final.code != 250:
+            throw errors.SmtpDataError("BDAT content rejected: " + String(final.code) + " " + final.text(), final.code, final.esc)
+        return final
+
+    # Build MAIL FROM ESMTP parameters from server capabilities + message flags (unsupported params are
+    # silently dropped so a call is always safe).
+    var mail_options = Function(self, size = None, eightbit = False, binarymime = False, smtputf8 = False, dsn_ret = None, dsn_envid = None):
+        var opts = []
+        if size != None and self.has_extension("SIZE"):
+            opts.append("SIZE=" + String(size))
+        if binarymime and self.has_extension("BINARYMIME"):
+            opts.append("BODY=BINARYMIME")
+        elif eightbit and self.has_extension("8BITMIME"):
+            opts.append("BODY=8BITMIME")
+        if smtputf8 and self.has_extension("SMTPUTF8"):
+            opts.append("SMTPUTF8")
+        if dsn_ret != None and self.has_extension("DSN"):
+            opts.append("RET=" + dsn_ret)
+        if dsn_envid != None and self.has_extension("DSN"):
+            opts.append("ENVID=" + dsn_envid)
+        return opts
+
+    # Build RCPT TO DSN parameters (RFC 3461). notify e.g. "SUCCESS,FAILURE,DELAY" or "NEVER".
+    var rcpt_options = Function(self, notify = None, orcpt = None):
+        var opts = []
+        if notify != None and self.has_extension("DSN"):
+            opts.append("NOTIFY=" + notify)
+        if orcpt != None and self.has_extension("DSN"):
+            opts.append("ORCPT=" + orcpt)
+        return opts
+
+    # The full RFC 5321 transaction. `recipients` may be a String or a list. Returns a Dict of refused
+    # recipients (addr -> [code, esc, text]); empty when all were accepted. Throws SmtpSenderRefused if
+    # MAIL is refused, SmtpRecipientsRefused if EVERY recipient is refused, SmtpDataError if DATA fails.
+    var sendmail = Function(self, from_addr, recipients, message, mail_options = None, rcpt_options = None, use_bdat = False):
+        var rcpts = recipients
+        if isinstance(recipients, String):
+            rcpts = [recipients]
+        if len(rcpts) == 0:
+            throw errors.SmtpError("sendmail: no recipients given")
+        self.mail(from_addr, mail_options)
+        var refused = {}
+        var accepted = 0
+        for r in rcpts:
+            var reply = self.rcpt(r, rcpt_options)
+            if reply.code == 250 or reply.code == 251:
+                accepted = accepted + 1
+            else:
+                refused[r] = [reply.code, reply.esc, reply.text()]
+        if accepted == 0:
+            try:
+                self.rset()
+            catch as e:
+                discard e
+            throw errors.SmtpRecipientsRefused(refused)
+        if use_bdat and self.has_extension("CHUNKING"):
+            self.data_bdat(message)
+        else:
+            self.data(message)
+        return refused
+
+    # --- housekeeping ---
+
+    var rset = Function(self):
+        return self._docmd("RSET", [250])
+
+    var noop = Function(self):
+        return self._docmd("NOOP", [250])
+
+    var vrfy = Function(self, address):
+        _check_arg(address, "VRFY address")
+        return self._docmd("VRFY " + address, None)
+
+    var expn = Function(self, address):
+        _check_arg(address, "EXPN address")
+        return self._docmd("EXPN " + address, None)
+
+    var help = Function(self, arg = None):
+        var cmd = "HELP"
+        if arg != None:
+            cmd = cmd + " " + _check_arg(arg, "HELP argument")
+        return self._docmd(cmd, None)
+
+    var quit = Function(self):
+        var reply = None
+        try:
+            reply = self._docmd("QUIT", None)
+        catch errors.SmtpServerDisconnected as e:
+            discard e
+        self.close()
+        return reply
+
+    var close = Function(self):
+        if self._t != None and not self._closed:
+            self._closed = True
+            self._t.close()
+
+    # context-manager support: `with SmtpClient(...) as c:`
+    var _enter_ = Function(self):
+        return self
+
+    var _exit_ = Function(self):
+        try:
+            self.quit()
+        catch as e:
+            discard e
