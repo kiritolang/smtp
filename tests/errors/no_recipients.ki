@@ -1,0 +1,4 @@
+var C = import("smtp.client")
+var T = import("smtp.transport")
+var c = C.SmtpClient(transport = T.FakeTransport("220 mx\r\n"))
+discard c.sendmail("a@x.com", [], "Subject: x\r\n\r\nbody\r\n")

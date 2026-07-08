@@ -1,0 +1,2 @@
+var parse = import("smtp.parse")
+discard parse.parse_reply_line("this is not a reply line")
