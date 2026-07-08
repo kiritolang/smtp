@@ -1,0 +1,280 @@
+# Building RFC 5322 / MIME messages. MailBuilder is a fluent API for from/to/cc/bcc/subject/headers,
+# text + HTML alternatives, attachments, and inline (cid) images; build() emits the full message as a
+# String with the correct MIME tree (multipart/mixed > related > alternative as needed). Header/address
+# injection (a raw CR/LF/NUL) is rejected. recipients() / envelope_sender() expose the SMTP envelope.
+
+var mime = import("smtp.mime")
+var address = import("smtp.address")
+var errors = import("smtp.errors")
+var time = import("time")
+
+# --- injection guards ---------------------------------------------------------------------------
+
+var _no_crlf = Function(s, what):
+    if s == None:
+        return
+    if s.find("\r") >= 0 or s.find("\n") >= 0 or s.find("\x00") >= 0:
+        throw errors.SmtpError(what + " contains a CR/LF/NUL character — header injection blocked")
+
+var _check_header_name = Function(name):
+    if len(name) == 0:
+        throw errors.SmtpError("empty header name")
+    for c in name:
+        var o = ord(c)
+        if o <= 32 or o == 127 or c == ":":
+            throw errors.SmtpError("invalid header name '" + name + "'")
+
+# --- pure MIME entity assembly (an entity = {headers: [line, ...], body: String}) ---------------
+
+var _serialize_entity = Function(ent):
+    return "\r\n".join(ent["headers"]) + "\r\n\r\n" + ent["body"]
+
+var _multipart = Function(subtype, children):
+    var boundary = mime.gen_boundary()
+    var body = ""
+    for ch in children:
+        body = body + "--" + boundary + "\r\n" + _serialize_entity(ch) + "\r\n"
+    body = body + "--" + boundary + "--\r\n"
+    var ct = "Content-Type: multipart/" + subtype + ";\r\n boundary=\"" + boundary + "\""
+    return {"headers": [ct], "body": body}
+
+var _can_7bit = Function(text):
+    if not mime.is_ascii(text):
+        return False
+    for c in text:
+        if ord(c) == 0:
+            return False
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if len(line) > 990:
+            return False
+    return True
+
+var _text_leaf = Function(text, subtype, charset):
+    if _can_7bit(text):
+        var content = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        return {"headers": ["Content-Type: text/" + subtype + "; charset=us-ascii", "Content-Transfer-Encoding: 7bit"], "body": content}
+    return {"headers": ["Content-Type: text/" + subtype + "; charset=" + charset, "Content-Transfer-Encoding: quoted-printable"], "body": mime.qp_encode(text)}
+
+var _attachment_leaf = Function(att):
+    var ct = "Content-Type: " + att["content_type"] + ";\r\n " + mime.rfc2231_param("name", att["filename"])
+    var disp_kind = "attachment"
+    if att["inline"]:
+        disp_kind = "inline"
+    var disp = "Content-Disposition: " + disp_kind + ";\r\n " + mime.rfc2231_param("filename", att["filename"])
+    var headers = [ct, "Content-Transfer-Encoding: base64", disp]
+    if att["inline"] and att["cid"] != None:
+        headers.append("Content-ID: <" + att["cid"] + ">")
+    return {"headers": headers, "body": mime.b64_body(att["data"])}
+
+var _fmt_addrs = Function(addrs):
+    var parts = []
+    for a in addrs:
+        parts.append(address.format_addr(a[0], a[1]))
+    return ", ".join(parts)
+
+# --- the fluent builder -------------------------------------------------------------------------
+
+class MailBuilder:
+    var _init_ = Function(self):
+        self._from = None
+        self._sender = None
+        self._to = []
+        self._cc = []
+        self._bcc = []
+        self._reply_to = []
+        self._subject = ""
+        self._headers = []
+        self._date = None
+        self._message_id = None
+        self._in_reply_to = None
+        self._references = None
+        self._text = None
+        self._html = None
+        self._attachments = []
+        self._charset = "utf-8"
+
+    var from_ = Function(self, email, name = ""):
+        self._from = [name, email]
+        return self
+
+    var sender = Function(self, email, name = ""):
+        self._sender = [name, email]
+        return self
+
+    var to = Function(self, email, name = ""):
+        self._to.append([name, email])
+        return self
+
+    var cc = Function(self, email, name = ""):
+        self._cc.append([name, email])
+        return self
+
+    var bcc = Function(self, email, name = ""):
+        self._bcc.append([name, email])
+        return self
+
+    var reply_to = Function(self, email, name = ""):
+        self._reply_to.append([name, email])
+        return self
+
+    var subject = Function(self, s):
+        self._subject = s
+        return self
+
+    var header = Function(self, name, value):
+        self._headers.append([name, value])
+        return self
+
+    var date = Function(self, epoch):
+        self._date = epoch
+        return self
+
+    var message_id = Function(self, mid):
+        self._message_id = mid
+        return self
+
+    var in_reply_to = Function(self, mid):
+        self._in_reply_to = mid
+        return self
+
+    var references = Function(self, refs):
+        self._references = refs
+        return self
+
+    var text = Function(self, body):
+        self._text = body
+        return self
+
+    var html = Function(self, body):
+        self._html = body
+        return self
+
+    var charset = Function(self, cs):
+        self._charset = cs
+        return self
+
+    # Attach a file part. `data` is a String or Bytes; content_type is guessed from the filename if not
+    # given. Set inline=True + a cid to reference it from HTML as `cid:<cid>`.
+    var attach = Function(self, filename, data, content_type = None, inline = False, cid = None):
+        var ct = content_type
+        if ct == None:
+            ct = mime.guess_content_type(filename)
+        self._attachments.append({"filename": filename, "data": data, "content_type": ct, "inline": inline, "cid": cid})
+        return self
+
+    # Inline (embed) an image/resource for HTML `cid:` references (multipart/related).
+    var embed = Function(self, filename, data, cid, content_type = None):
+        return self.attach(filename, data, content_type, True, cid)
+
+    # The SMTP envelope recipients: To + Cc + Bcc addr-specs, de-duplicated.
+    var recipients = Function(self):
+        var out = []
+        var groups = [self._to, self._cc, self._bcc]
+        for g in groups:
+            for a in g:
+                if not (a[1] in out):
+                    out.append(a[1])
+        return out
+
+    # The SMTP envelope sender (explicit Sender, else From).
+    var envelope_sender = Function(self):
+        if self._sender != None:
+            return self._sender[1]
+        if self._from != None:
+            return self._from[1]
+        return None
+
+    # --- build (private helpers are methods so they can read the private fields) ---
+
+    var _from_domain = Function(self):
+        if self._from != None:
+            var at = self._from[1].rfind("@")
+            if at >= 0:
+                return self._from[1][at + 1:]
+        return "localhost"
+
+    var _validate = Function(self):
+        _no_crlf(self._subject, "subject")
+        for h in self._headers:
+            _check_header_name(h[0])
+            _no_crlf(h[1], "value of header '" + h[0] + "'")
+        var addrs = []
+        if self._from != None:
+            addrs.append(self._from)
+        if self._sender != None:
+            addrs.append(self._sender)
+        var groups = [self._to, self._cc, self._bcc, self._reply_to]
+        for g in groups:
+            for a in g:
+                addrs.append(a)
+        for a in addrs:
+            _no_crlf(a[0], "display name")
+            _no_crlf(a[1], "email address")
+            if a[1].find("@") < 0:
+                throw errors.SmtpError("address '" + a[1] + "' is not a valid addr-spec (no '@')")
+
+    var _body_part = Function(self):
+        if self._text != None and self._html != None:
+            return _multipart("alternative", [_text_leaf(self._text, "plain", self._charset), _text_leaf(self._html, "html", self._charset)])
+        if self._html != None:
+            return _text_leaf(self._html, "html", self._charset)
+        if self._text != None:
+            return _text_leaf(self._text, "plain", self._charset)
+        return _text_leaf("", "plain", self._charset)
+
+    var _top_headers = Function(self):
+        var lines = []
+        var d = self._date
+        if d == None:
+            d = time.time()
+        lines.append(mime.fold_header("Date", mime.format_date(d)))
+        if self._from != None:
+            lines.append(mime.header("From", _fmt_addrs([self._from])))
+        if self._sender != None:
+            lines.append(mime.header("Sender", _fmt_addrs([self._sender])))
+        if len(self._to) > 0:
+            lines.append(mime.header("To", _fmt_addrs(self._to)))
+        if len(self._cc) > 0:
+            lines.append(mime.header("Cc", _fmt_addrs(self._cc)))
+        if len(self._reply_to) > 0:
+            lines.append(mime.header("Reply-To", _fmt_addrs(self._reply_to)))
+        lines.append(mime.header("Subject", self._subject))
+        var mid = self._message_id
+        if mid == None:
+            mid = mime.make_message_id(self._from_domain())
+        lines.append(mime.fold_header("Message-ID", mid))
+        if self._in_reply_to != None:
+            lines.append(mime.fold_header("In-Reply-To", self._in_reply_to))
+        if self._references != None:
+            lines.append(mime.fold_header("References", self._references))
+        for h in self._headers:
+            lines.append(mime.header(h[0], h[1]))
+        lines.append("MIME-Version: 1.0")
+        return lines
+
+    # Serialize to the full RFC 5322 message String (headers + MIME body). Bcc is NOT included.
+    var build = Function(self):
+        self._validate()
+        var root = self._body_part()
+        var inline = []
+        var regular = []
+        for a in self._attachments:
+            if a["inline"]:
+                inline.append(a)
+            else:
+                regular.append(a)
+        if len(inline) > 0:
+            var children = [root]
+            for a in inline:
+                children.append(_attachment_leaf(a))
+            root = _multipart("related", children)
+        if len(regular) > 0:
+            var children = [root]
+            for a in regular:
+                children.append(_attachment_leaf(a))
+            root = _multipart("mixed", children)
+        var all_headers = self._top_headers() + root["headers"]
+        return "\r\n".join(all_headers) + "\r\n\r\n" + root["body"]
+
+# Message is an alias for MailBuilder (build() gives the wire form).
+var Message = MailBuilder

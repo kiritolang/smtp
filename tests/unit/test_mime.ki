@@ -1,0 +1,55 @@
+# Tests for smtp.mime — content encodings, RFC 2047/2231 header encoding, folding, date/content-type.
+var M = import("smtp.mime")
+var t = import("harness").Tester("mime")
+
+var max_line = Function(s):
+    var m = 0
+    for l in s.split("\r\n"):
+        if len(l) > m:
+            m = len(l)
+    return m
+
+# --- base64 body ---
+t.eq("b64 short", M.b64_body("Hello"), "SGVsbG8=")
+var wrapped = M.b64_body("A" * 200)
+t.check("b64 wrapped <=76", max_line(wrapped) <= 76)
+t.eq("b64 roundtrip", M.b64_decode_body(M.b64_body("hello world")).decode("utf-8"), "hello world")
+t.eq("b64 binary roundtrip", M.b64_decode_body(M.b64_body(Bytes([0, 255, 16, 200]))), Bytes([0, 255, 16, 200]))
+
+# --- quoted-printable ---
+t.eq("qp equals", M.qp_encode("a=b"), "a=3Db")
+t.eq("qp utf8", M.qp_encode("café"), "caf=C3=A9")
+t.eq("qp trailing space", M.qp_encode("x "), "x=20")
+t.eq("qp plain passes through", M.qp_encode("Hello World"), "Hello World")
+t.eq("qp decode", M.qp_decode("caf=C3=A9").decode("utf-8"), "café")
+t.eq("qp decode softbreak", M.qp_decode("ab=\r\ncd").decode("latin-1"), "abcd")
+t.eq("qp roundtrip", M.qp_decode(M.qp_encode("Ünïcode = fun!")).decode("utf-8"), "Ünïcode = fun!")
+t.check("qp long line soft-wrapped", max_line(M.qp_encode("x" * 200)) <= 76)
+
+# --- RFC 2047 encoded-words ---
+t.eq("encode_word", M.encode_word("café"), "=?utf-8?B?Y2Fmw6k=?=")
+t.eq("ascii header unchanged", M.encode_header_value("Hello World"), "Hello World")
+t.check("nonascii header encoded", M.encode_header_value("Grüße").find("=?utf-8?B?") == 0)
+t.check("long nonascii multiple words", len(M.encode_header_value("é" * 100).split(" ")) > 1)
+
+# --- folding ---
+t.eq("fold short unchanged", M.fold_header("Subject", "short subject"), "Subject: short subject")
+var f2 = M.fold_header("X-Long", ("word " * 40).strip())
+t.check("fold has continuation", f2.find("\r\n ") >= 0)
+t.check("folded lines <=78", max_line(f2) <= 78)
+
+# --- RFC 2231 params ---
+t.eq("param token", M.rfc2231_param("filename", "report.pdf"), "filename=report.pdf")
+t.check("param quoted for space", M.rfc2231_param("filename", "my report.pdf").find("filename=\"my report.pdf\"") == 0)
+t.check("param nonascii rfc2231", M.rfc2231_param("filename", "réponse.pdf").find("filename*=utf-8''") == 0)
+
+# --- date / content-type / ids ---
+t.eq("date epoch0 utc", M.format_date(0), "Thu, 01 Jan 1970 00:00:00 +0000")
+t.eq("ct pdf", M.guess_content_type("doc.pdf"), "application/pdf")
+t.eq("ct png case-insensitive", M.guess_content_type("img.PNG"), "image/png")
+t.eq("ct unknown", M.guess_content_type("x.zzz"), "application/octet-stream")
+t.eq("ct no ext", M.guess_content_type("noext"), "application/octet-stream")
+t.check("msgid format", M.make_message_id("example.com").find("@example.com>") > 0)
+t.check("boundary prefix", M.gen_boundary().find("----=_Part_") == 0)
+
+t.done()

@@ -1,0 +1,255 @@
+# MIME encoders/decoders and RFC 5322 header formatting: base64 + quoted-printable content encodings,
+# RFC 2047 encoded-words for non-ASCII headers, RFC 2231 parameter encoding for non-ASCII filenames,
+# header folding, and the Date / Message-ID / boundary / content-type helpers. All pure functions.
+
+var base64 = import("base64")
+var time = import("time")
+var bu = import("smtp.bytesutil")
+
+# --- character predicates ---
+
+var is_ascii = Function(s):
+    for c in s:
+        if ord(c) > 127:
+            return False
+    return True
+
+var has_ctrl = Function(s):
+    for c in s:
+        var o = ord(c)
+        if (o < 32 and o != 9) or o == 127:
+            return True
+    return False
+
+# --- base64 content transfer encoding (RFC 2045) ---
+
+# Encode data (Bytes/String) as base64 wrapped to 76-character lines separated by CRLF.
+var b64_body = Function(data):
+    var raw = base64.encode(bu.as_bytes(data))
+    var out = []
+    var i = 0
+    while i < len(raw):
+        out.append(raw[i:i + 76])
+        i = i + 76
+    return "\r\n".join(out)
+
+# Decode a base64 body (ignoring embedded whitespace/newlines) -> Bytes.
+var b64_decode_body = Function(s):
+    var clean = s.replace("\r", "").replace("\n", "").replace(" ", "").replace("\t", "")
+    return Bytes(base64.decode(clean))
+
+# --- quoted-printable (RFC 2045) ---
+
+var _qp_wrap = Function(tokens):
+    var line = ""
+    var out = ""
+    for tok in tokens:
+        if len(line) + len(tok) > 75:
+            out = out + line + "=\r\n"
+            line = ""
+        line = line + tok
+    return out + line
+
+var _qp_line = Function(line):
+    var tokens = []
+    var bytes = bu.to_list(line.encode("utf-8"))
+    var i = 0
+    var n = len(bytes)
+    while i < n:
+        var b = bytes[i]
+        var is_last = (i == n - 1)
+        if b == 61:
+            tokens.append("=3D")
+        elif b == 32 or b == 9:
+            if is_last:
+                tokens.append("=" + format(b, "02X"))
+            else:
+                tokens.append(chr(b))
+        elif b >= 33 and b <= 126:
+            tokens.append(chr(b))
+        else:
+            tokens.append("=" + format(b, "02X"))
+        i = i + 1
+    return _qp_wrap(tokens)
+
+# Quoted-printable encode a text String. Line endings are normalized to CRLF hard breaks; long lines
+# soft-wrap at 76 columns; a trailing space/tab is encoded.
+var qp_encode = Function(text):
+    var s = text.replace("\r\n", "\n").replace("\r", "\n")
+    var out = []
+    for line in s.split("\n"):
+        out.append(_qp_line(line))
+    return "\r\n".join(out)
+
+# Quoted-printable decode -> Bytes.
+var qp_decode = Function(s):
+    var out = []
+    var i = 0
+    var n = len(s)
+    while i < n:
+        var c = s[i:i + 1]
+        if c == "=":
+            if i + 2 < n and s[i + 1:i + 3] == "\r\n":
+                i = i + 3
+            elif i + 1 < n and s[i + 1:i + 2] == "\n":
+                i = i + 2
+            elif i + 2 < n:
+                var pair = s[i + 1:i + 3]
+                var ok = True
+                var val = 0
+                try:
+                    val = fromhex(pair)[0]
+                catch as e:
+                    discard e
+                    ok = False
+                if ok:
+                    out.append(val)
+                    i = i + 3
+                else:
+                    out.append(61)
+                    i = i + 1
+            else:
+                out.append(61)
+                i = i + 1
+        else:
+            out.append(ord(c))
+            i = i + 1
+    return Bytes(out)
+
+# --- RFC 2047 encoded-words for non-ASCII header values ---
+
+var encode_word = Function(text, charset = "utf-8"):
+    return "=?" + charset + "?B?" + base64.encode(text.encode(charset)) + "?="
+
+var _chunk_by_utf8 = Function(s, maxbytes):
+    var chunks = []
+    var cur = ""
+    var curlen = 0
+    for c in s:
+        var clen = len(c.encode("utf-8"))
+        if curlen + clen > maxbytes and len(cur) > 0:
+            chunks.append(cur)
+            cur = ""
+            curlen = 0
+        cur = cur + c
+        curlen = curlen + clen
+    if len(cur) > 0:
+        chunks.append(cur)
+    return chunks
+
+# An all-ASCII, control-free value is returned unchanged; otherwise it is B-encoded into one or more
+# RFC 2047 encoded-words each kept under the 75-character limit.
+var encode_header_value = Function(value, charset = "utf-8"):
+    if is_ascii(value) and not has_ctrl(value):
+        return value
+    var words = []
+    for ch in _chunk_by_utf8(value, 45):
+        words.append(encode_word(ch, charset))
+    return " ".join(words)
+
+# --- header folding (RFC 5322) ---
+
+# Fold "Name: value" so no line exceeds 78 columns, breaking at spaces (continuation lines start with a
+# single space). Unbreakable long tokens are left over-long rather than split mid-token.
+var fold_header = Function(name, value):
+    var prefix = name + ": "
+    var limit = 78
+    var out = prefix
+    var linelen = len(prefix)
+    var first = True
+    for w in value.split(" "):
+        if first:
+            out = out + w
+            linelen = linelen + len(w)
+            first = False
+        elif linelen + 1 + len(w) <= limit:
+            out = out + " " + w
+            linelen = linelen + 1 + len(w)
+        else:
+            out = out + "\r\n " + w
+            linelen = 1 + len(w)
+    return out
+
+# Convenience: encode a header value then fold it.
+var header = Function(name, value, charset = "utf-8"):
+    return fold_header(name, encode_header_value(value, charset))
+
+# --- RFC 2231 parameter encoding (e.g. a non-ASCII attachment filename) ---
+
+var _ATTR_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+var _is_token = Function(s):
+    if len(s) == 0:
+        return False
+    for c in s:
+        if _ATTR_SAFE.find(c) < 0:
+            return False
+    return True
+
+var _pct_encode = Function(data):
+    var out = ""
+    for b in bu.to_list(data):
+        var c = chr(b)
+        if b < 128 and _ATTR_SAFE.find(c) >= 0:
+            out = out + c
+        else:
+            out = out + "%" + format(b, "02X")
+    return out
+
+# Format a MIME parameter. A plain token is bare; ASCII-with-specials is quoted; non-ASCII uses the
+# RFC 2231 `name*=charset''pct-encoded` form.
+var rfc2231_param = Function(name, value, charset = "utf-8"):
+    if _is_token(value):
+        return name + "=" + value
+    if is_ascii(value) and not has_ctrl(value):
+        return name + "=\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+    return name + "*=" + charset + "''" + _pct_encode(value.encode(charset))
+
+# --- misc header helpers ---
+
+# RFC 5322 date in UTC, e.g. "Tue, 01 Jul 2025 12:00:00 +0000". `epoch` in seconds (default: now).
+var format_date = Function(epoch = None):
+    var ep = epoch
+    if ep == None:
+        ep = time.time()
+    return time.datetime(ep).format("%a, %d %b %Y %H:%M:%S") + " +0000"
+
+var _rand_hex = Function(nchars):
+    var rng = import("random").Random(time.timens())
+    var out = ""
+    var i = 0
+    while i < nchars:
+        out = out + format(rng.randint(0, 15), "x")
+        i = i + 1
+    return out
+
+var make_message_id = Function(domain = None):
+    var d = domain
+    if d == None:
+        d = "localhost"
+    return "<" + _rand_hex(20) + "." + String(time.timens()) + "@" + d + ">"
+
+var gen_boundary = Function():
+    return "----=_Part_" + _rand_hex(24)
+
+var _CONTENT_TYPES = {
+    "txt": "text/plain", "text": "text/plain", "html": "text/html", "htm": "text/html",
+    "css": "text/css", "csv": "text/csv", "ics": "text/calendar", "md": "text/markdown",
+    "xml": "application/xml", "json": "application/json", "js": "application/javascript",
+    "pdf": "application/pdf", "zip": "application/zip", "gz": "application/gzip",
+    "tar": "application/x-tar", "bin": "application/octet-stream", "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint",
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "bmp": "image/bmp", "svg": "image/svg+xml", "webp": "image/webp", "ico": "image/x-icon",
+    "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "flac": "audio/flac",
+    "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime"
+}
+
+var guess_content_type = Function(filename):
+    var dot = filename.rfind(".")
+    if dot < 0:
+        return "application/octet-stream"
+    return _CONTENT_TYPES.get(filename[dot + 1:].lower(), "application/octet-stream")
