@@ -1,0 +1,49 @@
+name: nightly
+
+# Pull the latest released ki interpreter and run the whole smtp test suite against it. Runs on a
+# schedule (so a new ki release is exercised automatically) and on demand. A second matrix leg pins
+# the ki version that introduced socket TLS (1.13.0) so a regression in `latest` is distinguishable
+# from a break against a known-good build.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ki: ["latest", "1.13.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ki (${{ matrix.ki }})
+        run: |
+          if [ "${{ matrix.ki }}" = "latest" ]; then
+            URL="https://github.com/kiritolang/kiritolang.github.io/releases/latest/download/ki-linux-x64"
+          else
+            URL="https://github.com/kiritolang/kiritolang.github.io/releases/download/${{ matrix.ki }}/ki-linux-x64"
+          fi
+          curl -fsSL -o ki "$URL"
+          chmod +x ki
+          ./ki --version
+
+      - name: Report interpreter capabilities
+        run: |
+          printf 'import("io").print("version:", import("sys").version, "tlsenabled:", import("net").tlsenabled, "parallel cpus:", import("parallel").cpucount())\n' > /tmp/caps.ki
+          ./ki /tmp/caps.ki
+
+      - name: Run the test suite
+        run: bash run_tests.sh --ki "$PWD/ki"
