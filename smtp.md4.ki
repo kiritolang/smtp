@@ -1,0 +1,137 @@
+# MD4 (RFC 1320) in pure Kirito. The native `hash` module has MD5/SHA1/SHA256 but not MD4, which NTLM
+# authentication needs (NTLM's password hash is MD4 of the UTF-16LE password). Isolated here so nothing
+# else pays for it. 32-bit modular arithmetic is emulated by masking with 0xFFFFFFFF.
+
+var bu = import("smtp.bytesutil")
+
+var _MASK = 0xFFFFFFFF
+
+var _m = Function(x):
+    return bitand(x, _MASK)
+
+var _rotl = Function(x, n):
+    var v = bitand(x, _MASK)
+    return bitand(bitor(shl(v, n), shr(v, 32 - n)), _MASK)
+
+var _F = Function(x, y, z):
+    return bitor(bitand(x, y), bitand(bitnot(x), z))
+
+var _G = Function(x, y, z):
+    return bitor(bitor(bitand(x, y), bitand(x, z)), bitand(y, z))
+
+var _H = Function(x, y, z):
+    return bitxor(bitxor(x, y), z)
+
+var _FF = Function(a, b, c, d, x, s):
+    return _rotl(_m(a + _F(b, c, d) + x), s)
+
+var _GG = Function(a, b, c, d, x, s):
+    return _rotl(_m(a + _G(b, c, d) + x + 0x5a827999), s)
+
+var _HH = Function(a, b, c, d, x, s):
+    return _rotl(_m(a + _H(b, c, d) + x + 0x6ed9eba1), s)
+
+var _word_le = Function(w):
+    return [bitand(w, 255), bitand(shr(w, 8), 255), bitand(shr(w, 16), 255), bitand(shr(w, 24), 255)]
+
+var _block_words = Function(block, off):
+    var words = []
+    var i = off
+    var last = off + 64
+    while i < last:
+        words.append(_m(bitor(bitor(block[i], shl(block[i + 1], 8)), bitor(shl(block[i + 2], 16), shl(block[i + 3], 24)))))
+        i = i + 4
+    return words
+
+# MD4 digest of a Bytes/String, returned as 16-byte Bytes. `.hex()` for the hex string.
+var md4 = Function(data):
+    var msg = bu.as_bytes(data)
+    var bytes = bu.to_list(msg)
+    var bitlen = len(msg) * 8
+    bytes.append(0x80)
+    while (len(bytes) % 64) != 56:
+        bytes.append(0)
+    var bl = bitlen
+    var i = 0
+    while i < 8:
+        bytes.append(bitand(bl, 255))
+        bl = shr(bl, 8)
+        i = i + 1
+
+    var A = 0x67452301
+    var B = 0xefcdab89
+    var C = 0x98badcfe
+    var D = 0x10325476
+
+    var off = 0
+    while off < len(bytes):
+        var X = _block_words(bytes, off)
+        var a = A
+        var b = B
+        var c = C
+        var d = D
+
+        # Round 1 (s = 3,7,11,19; words in order)
+        a = _FF(a, b, c, d, X[0], 3)
+        d = _FF(d, a, b, c, X[1], 7)
+        c = _FF(c, d, a, b, X[2], 11)
+        b = _FF(b, c, d, a, X[3], 19)
+        a = _FF(a, b, c, d, X[4], 3)
+        d = _FF(d, a, b, c, X[5], 7)
+        c = _FF(c, d, a, b, X[6], 11)
+        b = _FF(b, c, d, a, X[7], 19)
+        a = _FF(a, b, c, d, X[8], 3)
+        d = _FF(d, a, b, c, X[9], 7)
+        c = _FF(c, d, a, b, X[10], 11)
+        b = _FF(b, c, d, a, X[11], 19)
+        a = _FF(a, b, c, d, X[12], 3)
+        d = _FF(d, a, b, c, X[13], 7)
+        c = _FF(c, d, a, b, X[14], 11)
+        b = _FF(b, c, d, a, X[15], 19)
+
+        # Round 2 (s = 3,5,9,13; word order 0,4,8,12,...)
+        a = _GG(a, b, c, d, X[0], 3)
+        d = _GG(d, a, b, c, X[4], 5)
+        c = _GG(c, d, a, b, X[8], 9)
+        b = _GG(b, c, d, a, X[12], 13)
+        a = _GG(a, b, c, d, X[1], 3)
+        d = _GG(d, a, b, c, X[5], 5)
+        c = _GG(c, d, a, b, X[9], 9)
+        b = _GG(b, c, d, a, X[13], 13)
+        a = _GG(a, b, c, d, X[2], 3)
+        d = _GG(d, a, b, c, X[6], 5)
+        c = _GG(c, d, a, b, X[10], 9)
+        b = _GG(b, c, d, a, X[14], 13)
+        a = _GG(a, b, c, d, X[3], 3)
+        d = _GG(d, a, b, c, X[7], 5)
+        c = _GG(c, d, a, b, X[11], 9)
+        b = _GG(b, c, d, a, X[15], 13)
+
+        # Round 3 (s = 3,9,11,15; word order 0,8,4,12,...)
+        a = _HH(a, b, c, d, X[0], 3)
+        d = _HH(d, a, b, c, X[8], 9)
+        c = _HH(c, d, a, b, X[4], 11)
+        b = _HH(b, c, d, a, X[12], 15)
+        a = _HH(a, b, c, d, X[2], 3)
+        d = _HH(d, a, b, c, X[10], 9)
+        c = _HH(c, d, a, b, X[6], 11)
+        b = _HH(b, c, d, a, X[14], 15)
+        a = _HH(a, b, c, d, X[1], 3)
+        d = _HH(d, a, b, c, X[9], 9)
+        c = _HH(c, d, a, b, X[5], 11)
+        b = _HH(b, c, d, a, X[13], 15)
+        a = _HH(a, b, c, d, X[3], 3)
+        d = _HH(d, a, b, c, X[11], 9)
+        c = _HH(c, d, a, b, X[7], 11)
+        b = _HH(b, c, d, a, X[15], 15)
+
+        A = _m(A + a)
+        B = _m(B + b)
+        C = _m(C + c)
+        D = _m(D + d)
+        off = off + 64
+
+    return Bytes(_word_le(A) + _word_le(B) + _word_le(C) + _word_le(D))
+
+var md4_hex = Function(data):
+    return md4(data).hex()

@@ -9,6 +9,7 @@
     "smtp.auth.ki",
     "smtp.hmac.ki",
     "smtp.md4.ki",
+    "smtp.bytesutil.ki",
     "smtp.message.ki",
     "smtp.mime.ki",
     "smtp.msgparse.ki",

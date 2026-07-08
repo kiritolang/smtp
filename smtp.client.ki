@@ -222,9 +222,9 @@ class SmtpClient:
 
     # --- authentication (delegates mechanism math to smtp.auth) ---
 
-    var login = Function(self, username, password, mechanism = "auto"):
+    var login = Function(self, username, password, mechanism = "auto", options = None):
         # Lazy import so the core client loads without the auth module (and its crypto) present.
-        return import("smtp.auth").authenticate(self, username, password, mechanism)
+        return import("smtp.auth").authenticate(self, username, password, mechanism, options)
 
     # Send one AUTH exchange step and return the raw reply (used by smtp.auth). `line` is already the
     # full command/continuation text; never logged verbatim when it may carry a secret.

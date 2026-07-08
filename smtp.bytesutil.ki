@@ -1,0 +1,33 @@
+# Small byte helpers shared across the crypto (hmac, md4) and MIME modules. Kept tiny and dependency
+# free.
+
+# Coerce to Bytes: a Bytes is returned as-is, a String is UTF-8 encoded, a List of 0-255 Integers is
+# packed. (Callers that need latin-1 semantics pass Bytes explicitly.)
+var as_bytes = Function(x):
+    if isinstance(x, Bytes):
+        return x
+    if isinstance(x, String):
+        return x.encode("utf-8")
+    return Bytes(x)
+
+# Bytes -> a List of Integer byte values.
+var to_list = Function(bs):
+    var o = []
+    for b in bs:
+        o.append(b)
+    return o
+
+# XOR two equal-length Bytes -> Bytes.
+var xor_bytes = Function(a, b):
+    var la = to_list(a)
+    var lb = to_list(b)
+    var o = []
+    var i = 0
+    while i < len(la):
+        o.append(bitxor(la[i], lb[i]))
+        i = i + 1
+    return Bytes(o)
+
+# Big-endian 32-bit integer as 4 Bytes (used by PBKDF2's block index).
+var u32_be = Function(n):
+    return Bytes([bitand(shr(n, 24), 255), bitand(shr(n, 16), 255), bitand(shr(n, 8), 255), bitand(n, 255)])

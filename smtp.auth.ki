@@ -1,0 +1,450 @@
+# SASL authentication mechanisms for SMTP AUTH (RFC 4954). Each mechanism has a pure response builder
+# (testable in isolation) plus an exchange runner driven through the client's auth_command(). The
+# `authenticate` driver picks and runs a mechanism. Client side is complete; server-side verification
+# helpers (used by smtp.server) live at the bottom.
+#
+# Mechanisms: PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-1, SCRAM-SHA-256, XOAUTH2, OAUTHBEARER,
+# EXTERNAL, ANONYMOUS, NTLM. For XOAUTH2/OAUTHBEARER the `password` argument is the OAuth2 access token.
+
+var base64 = import("base64")
+var hash = import("hash")
+var hmac = import("smtp.hmac")
+var md4 = import("smtp.md4")
+var bu = import("smtp.bytesutil")
+var errors = import("smtp.errors")
+
+# --- small helpers ------------------------------------------------------------------------------
+
+var _b64e = Function(data):
+    return base64.encode(data)
+
+# base64 text -> Bytes (base64.decode yields a List of ints).
+var _b64d = Function(s):
+    return Bytes(base64.decode(s))
+
+var _rng = Function():
+    var random = import("random")
+    var time = import("time")
+    return random.Random(time.timens())
+
+var _NONCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+var _nonce = Function(n):
+    var rng = _rng()
+    var out = ""
+    var i = 0
+    while i < n:
+        out = out + _NONCE_ALPHABET[rng.randint(0, len(_NONCE_ALPHABET) - 1)]
+        i = i + 1
+    return out
+
+# --- pure response builders ---------------------------------------------------------------------
+
+# PLAIN (RFC 4616): base64( authzid \0 authcid \0 passwd ).
+var plain = Function(authcid, passwd, authzid = ""):
+    return _b64e(authzid + "\x00" + authcid + "\x00" + passwd)
+
+# CRAM-MD5 (RFC 2195): base64( username SP hex(HMAC-MD5(passwd, challenge)) ). `challenge` is Bytes.
+var cram_md5 = Function(username, password, challenge):
+    return _b64e(username + " " + hmac.hmac_md5_hex(password, challenge))
+
+# XOAUTH2 (Google/Microsoft): base64( "user=" user ^A "auth=Bearer " token ^A ^A ).
+var xoauth2 = Function(user, token):
+    return _b64e("user=" + user + "\x01auth=Bearer " + token + "\x01\x01")
+
+# OAUTHBEARER (RFC 7628).
+var oauthbearer = Function(user, token, host = "", port = 0):
+    var body = "n,a=" + user + ",\x01"
+    if len(host) > 0:
+        body = body + "host=" + host + "\x01"
+    if port > 0:
+        body = body + "port=" + String(port) + "\x01"
+    body = body + "auth=Bearer " + token + "\x01\x01"
+    return _b64e(body)
+
+# EXTERNAL (RFC 4422): base64(authzid), or "=" for an empty initial response.
+var external = Function(authzid = ""):
+    if len(authzid) == 0:
+        return "="
+    return _b64e(authzid)
+
+# ANONYMOUS (RFC 4505): base64(trace) — an email or token identifying the anonymous user.
+var anonymous = Function(trace = ""):
+    return _b64e(trace)
+
+# --- SCRAM (RFC 5802 / 7677) --------------------------------------------------------------------
+
+var _saslname = Function(u):
+    return u.replace("=", "=3D").replace(",", "=2C")
+
+var _scram_parse = Function(s):
+    var out = {}
+    for pair in s.split(","):
+        var eq = pair.find("=")
+        if eq >= 0:
+            out[pair[0:eq]] = pair[eq + 1:]
+    return out
+
+var _scram_prf = Function(hashname):
+    if hashname == "sha256":
+        return hmac.hmac_sha256
+    return hmac.hmac_sha1
+
+var _scram_h = Function(hashname):
+    if hashname == "sha256":
+        return hash.sha256
+    return hash.sha1
+
+var _scram_dlen = Function(hashname):
+    if hashname == "sha256":
+        return 32
+    return 20
+
+# Given the password, decoded salt (Bytes), iteration count, and the three message parts, compute
+# [client_final_message, expected_server_signature_b64]. gs2_header is "n,," (no channel binding).
+var scram_proof = Function(hashname, password, salt, iters, client_first_bare, server_first, gs2_header, rnonce):
+    var prf = _scram_prf(hashname)
+    var hfn = _scram_h(hashname)
+    var salted = hmac.pbkdf2(prf, password, salt, iters, _scram_dlen(hashname))
+    var client_key = prf(salted, "Client Key")
+    var stored_key = fromhex(hfn(client_key))
+    var cfinal_noproof = "c=" + _b64e(gs2_header) + ",r=" + rnonce
+    var auth_message = client_first_bare + "," + server_first + "," + cfinal_noproof
+    var client_sig = prf(stored_key, auth_message)
+    var proof = bu.xor_bytes(client_key, client_sig)
+    var cfinal = cfinal_noproof + ",p=" + _b64e(proof)
+    var server_key = prf(salted, "Server Key")
+    var server_sig = _b64e(prf(server_key, auth_message))
+    return [cfinal, server_sig]
+
+# --- DIGEST-MD5 (RFC 2831) ----------------------------------------------------------------------
+
+# response-value hex for AUTHENTICATE. challenge is the parsed directive dict (needs realm, nonce).
+var digest_md5_response = Function(username, password, realm, nonce, cnonce, nc, digest_uri, qop):
+    var a1_head = fromhex(hash.md5(username + ":" + realm + ":" + password))
+    var a1 = hash.md5(a1_head + Bytes(":" + nonce + ":" + cnonce))
+    var a2 = hash.md5("AUTHENTICATE:" + digest_uri)
+    return hash.md5(a1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + a2)
+
+# Parse an RFC 2831 directive list: key=value or key="value", comma-separated.
+var _digest_parse = Function(s):
+    var out = {}
+    var i = 0
+    var n = len(s)
+    while i < n:
+        while i < n and (s[i:i + 1] == " " or s[i:i + 1] == ","):
+            i = i + 1
+        var eq = s.find("=", i)
+        if eq < 0:
+            break
+        var key = s[i:eq].strip()
+        var j = eq + 1
+        var val = ""
+        if j < n and s[j:j + 1] == "\"":
+            j = j + 1
+            while j < n and s[j:j + 1] != "\"":
+                val = val + s[j:j + 1]
+                j = j + 1
+            j = j + 1
+        else:
+            while j < n and s[j:j + 1] != ",":
+                val = val + s[j:j + 1]
+                j = j + 1
+        out[key] = val.strip()
+        i = j
+    return out
+
+# --- NTLM (MS-NLMP) -----------------------------------------------------------------------------
+
+# UTF-16LE encode a String (handles BMP + surrogate pairs) -> Bytes.
+var _utf16le = Function(s):
+    var out = []
+    for ch in s:
+        var cp = ord(ch)
+        if cp > 0xFFFF:
+            cp = cp - 0x10000
+            var hi = 0xD800 + shr(cp, 10)
+            var lo = 0xDC00 + bitand(cp, 0x3FF)
+            out.append(bitand(hi, 255))
+            out.append(bitand(shr(hi, 8), 255))
+            out.append(bitand(lo, 255))
+            out.append(bitand(shr(lo, 8), 255))
+        else:
+            out.append(bitand(cp, 255))
+            out.append(bitand(shr(cp, 8), 255))
+    return Bytes(out)
+
+# NTLM NT hash (NTOWFv1): MD4(UTF-16LE(password)) -> 16 Bytes.
+var nt_hash = Function(password):
+    return md4.md4(_utf16le(password))
+
+# NTLMv2 hash (NTOWFv2): HMAC-MD5(NThash, UTF-16LE(UPPER(user) + domain)) -> 16 Bytes.
+var ntowfv2 = Function(username, password, domain):
+    return hmac.hmac_md5(nt_hash(password), _utf16le(username.upper() + domain))
+
+var _u16le_i = Function(n):
+    return Bytes([bitand(n, 255), bitand(shr(n, 8), 255)])
+
+var _u32le_i = Function(n):
+    return Bytes([bitand(n, 255), bitand(shr(n, 8), 255), bitand(shr(n, 16), 255), bitand(shr(n, 24), 255)])
+
+# Type 1 (negotiate) message, base64. Minimal, requesting Unicode + NTLM + always-sign.
+var ntlm_type1 = Function(domain = "", workstation = ""):
+    var flags = 0xE2088297
+    var msg = Bytes("NTLMSSP\x00") + _u32le_i(1) + _u32le_i(flags)
+    # empty domain/workstation security buffers (len=0, maxlen=0, offset=32)
+    msg = msg + _u16le_i(0) + _u16le_i(0) + _u32le_i(32)
+    msg = msg + _u16le_i(0) + _u16le_i(0) + _u32le_i(32)
+    return _b64e(msg)
+
+# Parse a Type 2 (challenge) message (raw Bytes): return {challenge: 8 Bytes, target_info: Bytes}.
+var ntlm_parse_type2 = Function(raw):
+    var chal = raw[24:32]
+    var target_info = Bytes("")
+    if len(raw) >= 48:
+        var ti_len = raw[40] + shl(raw[41], 8)
+        var ti_off = raw[44] + shl(raw[45], 8) + shl(raw[46], 16) + shl(raw[47], 24)
+        if ti_off + ti_len <= len(raw):
+            target_info = raw[ti_off:ti_off + ti_len]
+    return {"challenge": chal, "target_info": target_info}
+
+# NTLMv2 response blob + NTProofStr. server_challenge/client_challenge: 8 Bytes; timestamp: Integer
+# (100ns ticks since 1601). Returns {nt_response: Bytes, session_base_key: Bytes}.
+var ntlmv2_response = Function(username, password, domain, server_challenge, target_info, client_challenge, timestamp):
+    var resp_key = ntowfv2(username, password, domain)
+    var ts = Bytes([bitand(timestamp, 255), bitand(shr(timestamp, 8), 255), bitand(shr(timestamp, 16), 255), bitand(shr(timestamp, 24), 255), bitand(shr(timestamp, 32), 255), bitand(shr(timestamp, 40), 255), bitand(shr(timestamp, 48), 255), bitand(shr(timestamp, 56), 255)])
+    var blob = Bytes([1, 1, 0, 0]) + _u32le_i(0) + ts + client_challenge + _u32le_i(0) + target_info + _u32le_i(0)
+    var proof = hmac.hmac_md5(resp_key, server_challenge + blob)
+    var session_base_key = hmac.hmac_md5(resp_key, proof)
+    return {"nt_response": proof + blob, "session_base_key": session_base_key}
+
+# --- the driver ---------------------------------------------------------------------------------
+
+var SUPPORTED_AUTO = ["SCRAM-SHA-256", "SCRAM-SHA-1", "CRAM-MD5", "LOGIN", "PLAIN"]
+
+var _choose = Function(offered):
+    for m in SUPPORTED_AUTO:
+        if m in offered:
+            return m
+    throw errors.SmtpAuthError("no mutually supported AUTH mechanism (server offered: " + ", ".join(offered) + ")")
+
+var _finish = Function(reply, mech):
+    if reply.code == 235:
+        return reply
+    throw errors.SmtpAuthError(mech + " authentication failed: " + String(reply.code) + " " + reply.text(), reply.code, reply.esc)
+
+# Run AUTH for `mechanism` (or auto-select). For XOAUTH2/OAUTHBEARER, `password` is the OAuth2 token.
+# `options` carries per-mechanism extras (domain/workstation for NTLM; an injected cnonce for tests).
+var authenticate = Function(client, username, password, mechanism = "auto", options = None):
+    var opts = options
+    if opts == None:
+        opts = {}
+    var mech = mechanism
+    if mech == "auto":
+        mech = _choose(client.supports_auth())
+    mech = mech.upper()
+
+    if mech == "PLAIN":
+        return _finish(client.auth_command("AUTH PLAIN " + plain(username, password), True), "PLAIN")
+    if mech == "LOGIN":
+        return _do_login(client, username, password)
+    if mech == "CRAM-MD5":
+        return _do_cram(client, username, password)
+    if mech == "SCRAM-SHA-1":
+        return _do_scram(client, username, password, "sha1", opts)
+    if mech == "SCRAM-SHA-256":
+        return _do_scram(client, username, password, "sha256", opts)
+    if mech == "DIGEST-MD5":
+        return _do_digest(client, username, password, opts)
+    if mech == "XOAUTH2":
+        return _do_bearer(client, "AUTH XOAUTH2 " + xoauth2(username, password), "XOAUTH2")
+    if mech == "OAUTHBEARER":
+        return _do_bearer(client, "AUTH OAUTHBEARER " + oauthbearer(username, password, opts.get("host", ""), opts.get("port", 0)), "OAUTHBEARER")
+    if mech == "EXTERNAL":
+        return _finish(client.auth_command("AUTH EXTERNAL " + external(username), True), "EXTERNAL")
+    if mech == "ANONYMOUS":
+        return _finish(client.auth_command("AUTH ANONYMOUS " + anonymous(username), False), "ANONYMOUS")
+    if mech == "NTLM":
+        return _do_ntlm(client, username, password, opts)
+    throw errors.SmtpAuthError("unsupported AUTH mechanism: " + mech)
+
+var _do_login = Function(client, username, password):
+    var r = client.auth_command("AUTH LOGIN", False)
+    if r.code != 334:
+        throw errors.SmtpAuthError("LOGIN: server did not prompt for a username (" + String(r.code) + ")", r.code)
+    r = client.auth_command(_b64e(username), True)
+    if r.code != 334:
+        throw errors.SmtpAuthError("LOGIN: server rejected the username step (" + String(r.code) + ")", r.code)
+    return _finish(client.auth_command(_b64e(password), True), "LOGIN")
+
+var _do_cram = Function(client, username, password):
+    var r = client.auth_command("AUTH CRAM-MD5", False)
+    if r.code != 334:
+        throw errors.SmtpAuthError("CRAM-MD5: server did not issue a challenge (" + String(r.code) + ")", r.code)
+    var challenge = _b64d(r.text().strip())
+    return _finish(client.auth_command(cram_md5(username, password, challenge), True), "CRAM-MD5")
+
+var _do_bearer = Function(client, command, mech):
+    var r = client.auth_command(command, True)
+    if r.code == 235:
+        return r
+    if r.code == 334:
+        var detail = _b64d(r.text().strip()).decode("latin-1")
+        client.auth_command("", True)
+        throw errors.SmtpAuthError(mech + " failed: " + detail)
+    throw errors.SmtpAuthError(mech + " failed: " + String(r.code) + " " + r.text(), r.code, r.esc)
+
+var _do_scram = Function(client, username, password, hashname, opts):
+    var mech = "SCRAM-SHA-1"
+    if hashname == "sha256":
+        mech = "SCRAM-SHA-256"
+    var cnonce = opts.get("cnonce", None)
+    if cnonce == None:
+        cnonce = _nonce(24)
+    var gs2 = "n,,"
+    var cfirst_bare = "n=" + _saslname(username) + ",r=" + cnonce
+    var r = client.auth_command("AUTH " + mech + " " + _b64e(gs2 + cfirst_bare), True)
+    if r.code != 334:
+        throw errors.SmtpAuthError(mech + ": unexpected reply to the initial message (" + String(r.code) + ")", r.code)
+    var sfirst = _b64d(r.text().strip()).decode("latin-1")
+    var attrs = _scram_parse(sfirst)
+    if not ("r" in attrs) or attrs["r"].find(cnonce) != 0:
+        throw errors.SmtpAuthError(mech + ": server nonce does not extend the client nonce")
+    var salt = _b64d(attrs["s"])
+    var comp = scram_proof(hashname, password, salt, Integer(attrs["i"]), cfirst_bare, sfirst, gs2, attrs["r"])
+    r = client.auth_command(_b64e(comp[0]), True)
+    if r.code == 334:
+        var sfinal = _b64d(r.text().strip()).decode("latin-1")
+        _scram_verify(sfinal, comp[1], mech)
+        return _finish(client.auth_command("", True), mech)
+    if r.code == 235:
+        var txt = r.text().strip()
+        if txt.find("v=") == 0:
+            _scram_verify(txt, comp[1], mech)
+        return r
+    throw errors.SmtpAuthError(mech + " authentication failed: " + String(r.code) + " " + r.text(), r.code, r.esc)
+
+var _scram_verify = Function(sfinal, expected_b64, mech):
+    var attrs = _scram_parse(sfinal)
+    if not ("v" in attrs) or attrs["v"] != expected_b64:
+        throw errors.SmtpAuthError(mech + ": server signature verification failed (possible MITM)")
+
+var _do_digest = Function(client, username, password, opts):
+    var r = client.auth_command("AUTH DIGEST-MD5", False)
+    if r.code != 334:
+        throw errors.SmtpAuthError("DIGEST-MD5: no challenge (" + String(r.code) + ")", r.code)
+    var challenge = _digest_parse(_b64d(r.text().strip()).decode("latin-1"))
+    var realm = challenge.get("realm", "")
+    var nonce = challenge["nonce"]
+    var cnonce = opts.get("cnonce", _nonce(24))
+    var nc = "00000001"
+    var uri = "smtp/" + opts.get("host", client.host)
+    var resp = digest_md5_response(username, password, realm, nonce, cnonce, nc, uri, "auth")
+    var directives = "charset=utf-8,username=\"" + username + "\",realm=\"" + realm + "\",nonce=\"" + nonce + "\",nc=" + nc + ",cnonce=\"" + cnonce + "\",digest-uri=\"" + uri + "\",response=" + resp + ",qop=auth"
+    r = client.auth_command(_b64e(directives), True)
+    if r.code == 334:
+        # rspauth -> acknowledge with an empty response
+        return _finish(client.auth_command("", True), "DIGEST-MD5")
+    return _finish(r, "DIGEST-MD5")
+
+var _do_ntlm = Function(client, username, password, opts):
+    var domain = opts.get("domain", "")
+    var workstation = opts.get("workstation", "")
+    var r = client.auth_command("AUTH NTLM " + ntlm_type1(domain, workstation), True)
+    if r.code != 334:
+        throw errors.SmtpAuthError("NTLM: server did not issue a Type 2 challenge (" + String(r.code) + ")", r.code)
+    var type2 = _b64d(r.text().strip())
+    var parsed = ntlm_parse_type2(type2)
+    var client_challenge = opts.get("client_challenge", fromhex(_nonce_hex(8)))
+    var timestamp = opts.get("timestamp", _now_filetime())
+    var v2 = ntlmv2_response(username, password, domain, parsed["challenge"], parsed["target_info"], client_challenge, timestamp)
+    var type3 = _ntlm_type3(username, domain, workstation, v2["nt_response"])
+    return _finish(client.auth_command(_b64e(type3), True), "NTLM")
+
+var _nonce_hex = Function(nbytes):
+    var rng = _rng()
+    var out = ""
+    var i = 0
+    while i < nbytes:
+        out = out + format(rng.randint(0, 255), "02x")
+        i = i + 1
+    return out
+
+var _now_filetime = Function():
+    # Windows FILETIME: 100ns ticks since 1601-01-01. Unix epoch is 11644473600 s later.
+    var time = import("time")
+    return (Integer(time.time()) + 11644473600) * 10000000
+
+# Build a minimal Type 3 (authenticate) message with the NTLMv2 response and an empty LM field.
+var _ntlm_type3 = Function(username, domain, workstation, nt_response):
+    var dom = _utf16le(domain)
+    var usr = _utf16le(username)
+    var wks = _utf16le(workstation)
+    var lm = Bytes(24)
+    var payload_off = 64
+    var off = payload_off
+    var lm_off = off
+    off = off + len(lm)
+    var nt_off = off
+    off = off + len(nt_response)
+    var dom_off = off
+    off = off + len(dom)
+    var usr_off = off
+    off = off + len(usr)
+    var wks_off = off
+    off = off + len(wks)
+    var flags = 0xE2088297
+    var m = Bytes("NTLMSSP\x00") + _u32le_i(3)
+    m = m + _sec_buf(len(lm), lm_off)
+    m = m + _sec_buf(len(nt_response), nt_off)
+    m = m + _sec_buf(len(dom), dom_off)
+    m = m + _sec_buf(len(usr), usr_off)
+    m = m + _sec_buf(len(wks), wks_off)
+    m = m + _sec_buf(0, off)          # session key (empty)
+    m = m + _u32le_i(flags)
+    m = m + lm + nt_response + dom + usr + wks
+    return m
+
+var _sec_buf = Function(length, offset):
+    return _u16le_i(length) + _u16le_i(length) + _u32le_i(offset)
+
+# --- server-side verification (used by smtp.server) ---------------------------------------------
+
+# Verify a PLAIN initial response (base64) against a (user -> password) lookup. Returns the authcid on
+# success, else None.
+var verify_plain = Function(b64, lookup):
+    var raw = _b64d(b64).decode("utf-8")
+    var parts = raw.split("\x00")
+    if len(parts) != 3:
+        return None
+    var authcid = parts[1]
+    var passwd = parts[2]
+    var expected = lookup(authcid)
+    if expected != None and expected == passwd:
+        return authcid
+    return None
+
+# Verify a LOGIN username/password pair (both base64) against a lookup.
+var verify_login = Function(user_b64, pass_b64, lookup):
+    var user = _b64d(user_b64).decode("utf-8")
+    var passwd = _b64d(pass_b64).decode("utf-8")
+    var expected = lookup(user)
+    if expected != None and expected == passwd:
+        return user
+    return None
+
+# Server-side CRAM-MD5: given the challenge we issued (Bytes), the client's base64 response, and a
+# lookup, return the username on success else None.
+var verify_cram_md5 = Function(challenge, response_b64, lookup):
+    var raw = _b64d(response_b64).decode("utf-8")
+    var sp = raw.rfind(" ")
+    if sp < 0:
+        return None
+    var user = raw[0:sp]
+    var digest = raw[sp + 1:]
+    var expected = lookup(user)
+    if expected == None:
+        return None
+    if hmac.hmac_md5_hex(expected, challenge) == digest:
+        return user
+    return None
