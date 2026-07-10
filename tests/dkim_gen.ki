@@ -1,0 +1,30 @@
+# Helper for tests/test_dkim_interop.py: generate an RSA key, DKIM-sign a canned message with the canon
+# given as arglist[0] ("relaxed" or "simple"), and print base64(public key) + base64(signed message) so
+# the Python side can decode them without any CRLF translation. Prints "SKIP" if the build has no crypto.
+var io = import("io")
+var sys = import("sys")
+var base64 = import("base64")
+
+var crypto = None
+try:
+    crypto = import("crypto")
+catch as e:
+    discard e
+if crypto == None or not crypto.enabled:
+    io.print("SKIP: no crypto in this ki build")
+    sys.exit(0)
+
+var dkim = import("smtp.dkim")
+var msg = import("smtp.message")
+
+var canon = "relaxed"
+if len(arglist) >= 1:
+    canon = arglist[0]
+
+var kp = crypto.rsagenerate(2048)
+var m = msg.MailBuilder().from_("alice@example.com", "Alice Example").to("bob@example.org", "Bob")
+m = m.subject("Interop test message").text("Line one has trailing spaces   \nLine two\n\n\n")
+var signed = dkim.sign(m.build(), "example.com", "selector1", kp["private"], None, canon, canon)
+
+io.print("PUBKEY_B64:" + base64.encode(kp["public"]))
+io.print("MESSAGE_B64:" + base64.encode(signed))

@@ -35,6 +35,9 @@ smtp.send(msg, "smtp.example.com", username = "me@example.com", password = "app-
   rejected.**
 - **Message parsing** — `parse_message()` turns a raw message back into a headers + parts tree
   (round-trips what the builder emits), decoding transfer encodings and RFC 2047 words.
+- **DKIM signing** — `dkim_sign()` adds an RFC 6376 `rsa-sha256` DKIM-Signature (relaxed/simple
+  canonicalization) using the interpreter's public-key crypto. Requires **ki ≥ 1.14.1**
+  (`crypto.enabled`).
 - **Receiving server** — `SmtpServer` speaks the protocol (EHLO/MAIL/RCPT/DATA/BDAT/AUTH/…) and hands
   each accepted message to your `on_message` callback.
 
@@ -43,6 +46,8 @@ smtp.send(msg, "smtp.example.com", username = "me@example.com", password = "app-
 - **ki ≥ 1.13.0** (the release that introduced socket-level TLS). Check with
   `import("net").tlsenabled` — it must be `True` for STARTTLS / SMTPS. The official release binaries
   are TLS-enabled.
+- **ki ≥ 1.14.1** for **DKIM signing** (needs the `crypto` module — `import("crypto").enabled`). The
+  rest of the library works on 1.13.0.
 
 ## Install
 
@@ -149,6 +154,28 @@ srv.serve_forever()
 The server is **plaintext** (see limitations). For AUTH, pass an `auth_lookup(username) -> password`
 function; it then advertises and verifies `AUTH PLAIN/LOGIN/CRAM-MD5`.
 
+## DKIM signing
+
+Requires **ki ≥ 1.14.1** (`import("crypto").enabled`). `dkim_sign()` prepends an RFC 6376 `rsa-sha256`
+DKIM-Signature (relaxed canonicalization by default):
+
+```kirito
+var signed = smtp.dkim_sign(msg.build(), "example.com", "selector1", private_key_pem)
+smtp.send(signed, "smtp.example.com", from_addr = "me@example.com", to = "you@example.org",
+          security = "starttls")
+```
+
+Or sign as part of `send()`:
+
+```kirito
+smtp.send(msg, "smtp.example.com", username = u, password = p,
+          dkim = {"domain": "example.com", "selector": "selector1", "private_key": private_key_pem})
+```
+
+`smtp.dkim_verify(message, public_key_pem)` checks a signature against an explicitly-supplied public
+key (the interpreter's `net` can't do DNS `TXT` lookups, so live `selector._domainkey` retrieval is out
+of scope). Publish the matching public key at `selector1._domainkey.example.com` as usual.
+
 ## Security model
 
 - TLS certificate verification is on by default; the peer certificate and hostname (SNI) are checked.
@@ -160,16 +187,18 @@ function; it then advertises and verifies `AUTH PLAIN/LOGIN/CRAM-MD5`.
 
 ## Limitations & scope
 
-Everything the SMTP / ESMTP / SASL / MIME surface needs and that pure Kirito can express is included.
-The exclusions are inherent to the language / interpreter, not the library:
+Everything the SMTP / ESMTP / SASL / MIME surface needs is included. The remaining limits are
+interpreter/API constraints, not the library:
 
-- **DKIM / S-MIME / PGP signing** require public-key cryptography (RSA/Ed25519, i.e. big-integer
-  modular exponentiation), which Kirito's fixed 64-bit integers cannot do. A signing-hook seam is left
-  for a future language with bignum. Symmetric crypto (all SASL, all MIME) is fully implemented.
+- **S/MIME and PGP** are not implemented. As of ki 1.14.1 the `crypto` module makes them *feasible* in
+  principle (RSA/EC + AES + `x509parse` are available), but they need substantial CMS/ASN.1 (S/MIME) or
+  OpenPGP-packet work that is out of scope here. **DKIM is implemented** (`dkim_sign`, ki ≥ 1.14.1).
 - **Server-side TLS**: the interpreter's socket TLS is client-side only, so a Kirito `SmtpServer` is
   plaintext. Put it behind [stunnel](https://www.stunnel.org/) for SMTPS.
 - **SCRAM `-PLUS` channel binding** is out of reach because the socket API exposes no TLS
   channel-binding material (`tls-unique` / `tls-server-end-point`).
+- **DKIM key retrieval by DNS** — `net` can't do arbitrary `TXT` lookups, so `dkim_verify` takes the
+  public key explicitly rather than resolving `selector._domainkey`.
 
 ## Package layout
 
@@ -187,6 +216,7 @@ Modules are flat files named with their dotted import name (how ki resolves pack
 | `smtp.msgparse` | message parser |
 | `smtp.address` | address parsing/formatting/validation |
 | `smtp.parse` | SMTP reply-grammar parsing |
+| `smtp.dkim` | DKIM signing/verification (RFC 6376, needs `crypto`) |
 | `smtp.errors` | the `SmtpError` hierarchy |
 
 ## Testing
@@ -197,10 +227,11 @@ chmod +x ki
 ./run_tests.sh --ki ./ki
 ```
 
-Runs the self-asserting unit suite (crypto/SASL against RFC vectors, MIME round-trips, the client state
-machine, adversarial + seeded fuzz tests), the error-message suite, a pure-Kirito live loopback test,
-and — if `python3` is present — the real-TLS harness driving STARTTLS and SMTPS against a mock server.
-The nightly GitHub Actions workflow runs all of this against the latest `ki` release.
+Runs the self-asserting unit suite (crypto/SASL against RFC vectors, MIME round-trips, DKIM, the client
+state machine, adversarial + seeded fuzz tests), the error-message suite, a pure-Kirito live loopback
+test, and — if `python3` is present — the real-TLS harness (STARTTLS + SMTPS against a mock server) and
+a DKIM interop check that verifies a Kirito-signed message with an independent `openssl` verifier. The
+nightly GitHub Actions workflow runs all of this against the latest `ki` release.
 
 ## License
 

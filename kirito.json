@@ -15,6 +15,7 @@
     "smtp.msgparse.ki",
     "smtp.address.ki",
     "smtp.parse.ki",
+    "smtp.dkim.ki",
     "smtp.errors.ki"
   ],
   "dependencies": []

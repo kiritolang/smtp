@@ -50,6 +50,15 @@ var _default_port = Function(security):
         return 465
     return 587
 
+# DKIM-sign a raw message, returning it with a DKIM-Signature header prepended. Requires a ki build
+# with public-key crypto (crypto.enabled, i.e. ki >= 1.14.1). Lazily imported so this facade still
+# loads on a crypto-less build (smtp.dkim imports the crypto module at load time).
+var dkim_sign = Function(message, domain, selector, private_key, headers = None, header_canon = "relaxed", body_canon = "relaxed"):
+    return import("smtp.dkim").sign(message, domain, selector, private_key, headers, header_canon, body_canon)
+
+var dkim_verify = Function(message, public_key):
+    return import("smtp.dkim").verify(message, public_key)
+
 # --- the high-level send ------------------------------------------------------------------------
 
 # Send a message end to end. `message` is a MailBuilder/Message (its build() + envelope are used) or a
@@ -59,7 +68,7 @@ var _default_port = Function(security):
 #   "auto":                          STARTTLS if offered, else plaintext
 #   "plain":                         no encryption
 # Returns a Dict of refused recipients (empty when all accepted). Raises an SmtpError on failure.
-var send = Function(message, host, port = None, username = None, password = None, security = "starttls", verify = True, server_hostname = None, timeout = 30, auth_mechanism = "auto", helo_name = None, from_addr = None, to = None, dsn_ret = None, dsn_notify = None, use_bdat = False, client = None):
+var send = Function(message, host, port = None, username = None, password = None, security = "starttls", verify = True, server_hostname = None, timeout = 30, auth_mechanism = "auto", helo_name = None, from_addr = None, to = None, dsn_ret = None, dsn_notify = None, use_bdat = False, dkim = None, client = None):
     var raw = None
     var envelope_from = from_addr
     var recipients = to
@@ -77,6 +86,10 @@ var send = Function(message, host, port = None, username = None, password = None
         throw errors.SmtpError("send: no envelope sender (pass from_addr, or a MailBuilder with a From)")
     if recipients == None or len(recipients) == 0:
         throw errors.SmtpError("send: no recipients (pass to, or a MailBuilder with recipients)")
+
+    # Optional DKIM signing: dkim = {domain, selector, private_key, [headers], [header_canon], [body_canon]}.
+    if dkim != None:
+        raw = import("smtp.dkim").sign(raw, dkim["domain"], dkim["selector"], dkim["private_key"], dkim.get("headers", None), dkim.get("header_canon", "relaxed"), dkim.get("body_canon", "relaxed"))
 
     var p = port
     if p == None:
