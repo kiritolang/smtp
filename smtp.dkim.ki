@@ -1,0 +1,202 @@
+# DKIM message signing (RFC 6376), `rsa-sha256`. Needs a ki build with public-key crypto
+# (`crypto.enabled`, i.e. ki >= 1.14.1) — DKIM is a digital signature over canonicalized headers + a
+# hash of the body, which requires RSA that pure Kirito could not do before 1.14.x added
+# arbitrary-precision integers and the `crypto` module.
+#
+#   var signed = dkim.sign(message, "example.com", "sel", private_key_pem)
+#   dkim.verify(signed, public_key_pem)   # -> True
+#
+# Verification here takes the public key explicitly (the interpreter's `net` cannot do DNS TXT lookups,
+# so live selector._domainkey lookups are out of scope); this is what you use to test a signature or
+# check one against a known key.
+
+var crypto = import("crypto")
+var hash = import("hash")
+var base64 = import("base64")
+var errors = import("smtp.errors")
+var time = import("time")
+
+# Headers signed by default (only those actually present are included, in this order).
+var DEFAULT_HEADERS = ["from", "to", "cc", "subject", "date", "message-id", "reply-to", "mime-version",
+                       "content-type", "content-transfer-encoding"]
+
+var _strip_wsp = Function(s):
+    return s.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+
+var _rstrip_sp = Function(s):
+    var e = len(s)
+    while e > 0 and (s[e - 1:e] == " " or s[e - 1:e] == "\t"):
+        e = e - 1
+    return s[0:e]
+
+# Split a raw message into [header_block, body].
+var _split = Function(message):
+    var i = message.find("\r\n\r\n")
+    if i >= 0:
+        return [message[0:i], message[i + 4:]]
+    var j = message.find("\n\n")
+    if j >= 0:
+        return [message[0:j], message[j + 2:]]
+    return [message, ""]
+
+# Header block -> ordered list of {name_lc, value, raw} preserving folding in `raw` and the unfolded
+# value in `value`.
+var _headers = Function(head):
+    var norm = head.replace("\r\n", "\n").replace("\r", "\n")
+    var hs = []
+    for ln in norm.split("\n"):
+        if len(ln) > 0 and (ln[0:1] == " " or ln[0:1] == "\t") and len(hs) > 0:
+            var last = hs[len(hs) - 1]
+            last["raw"] = last["raw"] + "\r\n" + ln
+            last["value"] = last["value"] + " " + ln.strip()
+        else:
+            var colon = ln.find(":")
+            if colon > 0:
+                hs.append({"name_lc": ln[0:colon].strip().lower(), "value": ln[colon + 1:].strip(), "raw": ln})
+    return hs
+
+# Relaxed header value: collapse WSP runs to a single SP, trim.
+var _relax_value = Function(v):
+    var s = v.replace("\t", " ")
+    while s.find("  ") >= 0:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+# Canonicalize one header (no trailing CRLF). `mode` is "relaxed" or "simple".
+var _canon_header = Function(mode, name_lc, value, raw):
+    if mode == "simple":
+        return raw
+    return name_lc + ":" + _relax_value(value)
+
+# Canonicalize the DKIM-Signature header from its (b-emptied) value.
+var _canon_dkim = Function(mode, value):
+    if mode == "simple":
+        return "DKIM-Signature: " + value
+    return "dkim-signature:" + _relax_value(value)
+
+# Canonicalize the body per RFC 6376 3.4.3/3.4.4.
+var _canon_body = Function(mode, body):
+    var b = body.replace("\r\n", "\n").replace("\r", "\n")
+    if mode == "simple":
+        while b.endswith("\n"):
+            b = b[0:len(b) - 1]
+        return b.replace("\n", "\r\n") + "\r\n"
+    var out = []
+    for line in b.split("\n"):
+        var l = line.replace("\t", " ")
+        while l.find("  ") >= 0:
+            l = l.replace("  ", " ")
+        out.append(_rstrip_sp(l))
+    var text = "\n".join(out)
+    while text.endswith("\n"):
+        text = text[0:len(text) - 1]
+    if len(text) == 0:
+        return ""
+    return text.replace("\n", "\r\n") + "\r\n"
+
+var _body_hash = Function(mode, body):
+    return base64.encode(fromhex(hash.sha256(_canon_body(mode, body))))
+
+# Empty the b= tag value in place (keep the tag + its leading WSP), preserving everything else exactly.
+var _empty_b = Function(value):
+    var parts = value.split(";")
+    var out = []
+    for p in parts:
+        if p.strip()[0:2] == "b=":
+            var lead = ""
+            var j = 0
+            while j < len(p) and (p[j:j + 1] == " " or p[j:j + 1] == "\t"):
+                lead = lead + p[j:j + 1]
+                j = j + 1
+            out.append(lead + "b=")
+        else:
+            out.append(p)
+    return ";".join(out)
+
+var _parse_tags = Function(value):
+    var out = {}
+    for seg in value.split(";"):
+        var s = seg.strip()
+        var eq = s.find("=")
+        if eq > 0:
+            out[s[0:eq].strip()] = s[eq + 1:].strip()
+    return out
+
+# Sign a raw RFC 5322 message and return it with a DKIM-Signature header prepended.
+var sign = Function(message, domain, selector, private_key, headers = None, header_canon = "relaxed", body_canon = "relaxed", timestamp = None):
+    if not crypto.enabled:
+        throw errors.SmtpError("DKIM signing needs a ki build with crypto (crypto.enabled is False; use ki >= 1.14.1)")
+    var parts = _split(message)
+    var hs = _headers(parts[0])
+    var bh = _body_hash(body_canon, parts[1])
+
+    var want = headers
+    if want == None:
+        want = DEFAULT_HEADERS
+    var signed = []
+    var names = []
+    for name in want:
+        var nl = name.lower()
+        for h in hs:
+            if h["name_lc"] == nl:
+                signed.append(h)
+                names.append(nl)
+                break
+
+    var ts = timestamp
+    if ts == None:
+        ts = Integer(time.time())
+    var value = "v=1; a=rsa-sha256; c=" + header_canon + "/" + body_canon + "; d=" + domain + "; s=" + selector + "; t=" + String(ts) + "; bh=" + bh + "; h=" + ":".join(names) + "; b="
+
+    var signed_data = ""
+    for h in signed:
+        signed_data = signed_data + _canon_header(header_canon, h["name_lc"], h["value"], h["raw"]) + "\r\n"
+    signed_data = signed_data + _canon_dkim(header_canon, value)
+
+    var sig = crypto.rsasign(private_key, signed_data, "sha256")
+    return "DKIM-Signature: " + value + base64.encode(sig) + "\r\n" + message
+
+# Verify a DKIM-Signature against an explicitly-supplied public key (PEM). Returns True iff the body
+# hash matches and the RSA signature is valid.
+var verify = Function(message, public_key):
+    if not crypto.enabled:
+        throw errors.SmtpError("DKIM verification needs a ki build with crypto (crypto.enabled is False)")
+    var parts = _split(message)
+    var hs = _headers(parts[0])
+    var dk = None
+    for h in hs:
+        if h["name_lc"] == "dkim-signature":
+            dk = h
+            break
+    if dk == None:
+        return False
+    var tags = _parse_tags(dk["value"])
+    if not ("b" in tags) or not ("bh" in tags) or not ("h" in tags):
+        return False
+
+    var header_canon = "simple"
+    var body_canon = "simple"
+    if "c" in tags:
+        var cc = tags["c"].split("/")
+        header_canon = cc[0]
+        if len(cc) > 1:
+            body_canon = cc[1]
+
+    if _strip_wsp(_body_hash(body_canon, parts[1])) != _strip_wsp(tags["bh"]):
+        return False
+
+    var signed_data = ""
+    for name in tags["h"].split(":"):
+        var nl = name.strip().lower()
+        for h in hs:
+            if h["name_lc"] == nl and h["name_lc"] != "dkim-signature":
+                signed_data = signed_data + _canon_header(header_canon, h["name_lc"], h["value"], h["raw"]) + "\r\n"
+                break
+    signed_data = signed_data + _canon_dkim(header_canon, _empty_b(dk["value"]))
+
+    var sig = Bytes(base64.decode(_strip_wsp(tags["b"])))
+    return crypto.rsaverify(public_key, signed_data, sig, "sha256")
+
+# True iff this ki build can do DKIM (has the crypto module).
+var available = Function():
+    return crypto.enabled

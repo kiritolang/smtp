@@ -88,6 +88,18 @@ else
   echo "  SKIP (python3 not found)"
 fi
 
+echo "-- DKIM interop (independent openssl verify) --"
+if command -v python3 >/dev/null 2>&1; then
+  if timeout 120 python3 "$REPO"/tests/test_dkim_interop.py --ki "$KI"; then
+    echo "  PASS dkim interop"
+  else
+    echo "  FAIL dkim interop"
+    fail=1
+  fi
+else
+  echo "  SKIP (python3 not found)"
+fi
+
 echo ""
 if [ "$fail" -eq 0 ]; then
   echo "ALL TESTS PASSED"

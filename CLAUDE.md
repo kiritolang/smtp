@@ -75,6 +75,7 @@ smtp.mime.ki       encoders/decoders (base64 wrap, quoted-printable, RFC 2047/22
 smtp.msgparse.ki   raw message -> headers + nested parts (round-trips message.build)
 smtp.address.ki    RFC 5321/5322 address parse/format/validate + SMTPUTF8
 smtp.parse.ki      SMTP reply-line / multiline / EHLO capability / enhanced status codes
+smtp.dkim.ki       DKIM signing/verification (RFC 6376 rsa-sha256; imports `crypto`, ki >= 1.14.1)
 smtp.errors.ki     exception hierarchy (SmtpError base)
 tests/             unit (self-asserting), errors (.ki+.experr), live_*.ki, mock server + Python harness
 ```
@@ -94,11 +95,16 @@ Tests run with `KIRITO_PATH=<repo-root>` so `import("smtp.*")` resolves to the w
 
 ## Scope
 
-Everything the SMTP/ESMTP/SASL/MIME surface needs and that pure Kirito can express is in scope. The only
-exclusions are features that require **public-key cryptography** (DKIM, S/MIME, PGP) — they need
-RSA/Ed25519 (arbitrary-precision modular exponentiation), which Kirito's fixed int64 cannot do. A
-signing-hook seam is left for them. Server-side TLS and SASL `-PLUS` channel binding are limited by the
-interpreter's socket API (documented in `README.md`).
+Everything the SMTP/ESMTP/SASL/MIME surface needs is in scope. **DKIM signing** (`smtp.dkim`) is
+implemented on top of the `crypto` module added in **ki 1.14.1** (RSA + arbitrary-precision integers) —
+so the module imports `crypto` at load time and is only usable on 1.14.1+; the facade lazy-imports it so
+`import("smtp")` still loads on 1.13.0, and `tests/unit/test_dkim.ki` + the interop harness self-skip
+when `crypto.enabled` is False. **S/MIME and PGP** are now *feasible* with `crypto` (RSA/EC/AES/x509parse)
+but are not implemented — they need substantial CMS/ASN.1 or OpenPGP-packet work. Remaining API limits:
+server-side TLS is client-only (plaintext server), SASL `-PLUS` channel binding has no socket support,
+and `dkim_verify` takes the key explicitly (`net` has no DNS TXT). Documented in `README.md`.
+
+Interpreter floor: **ki >= 1.13.0** for the socket TLS the client needs; **ki >= 1.14.1** for DKIM.
 
 ## Keep this file current
 

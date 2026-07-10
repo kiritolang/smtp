@@ -1,0 +1,70 @@
+# DKIM signing tests (RFC 6376, rsa-sha256). Requires a ki build with public-key crypto — skips
+# cleanly (exit 0) otherwise, so the nightly's pinned 1.13.0 leg passes.
+var io = import("io")
+var sys = import("sys")
+
+var crypto = None
+try:
+    crypto = import("crypto")
+catch as e:
+    discard e
+if crypto == None or not crypto.enabled:
+    io.print("dkim: SKIP (no crypto module in this ki build)")
+    sys.exit(0)
+
+var dkim = import("smtp.dkim")
+var msg = import("smtp.message")
+var hash = import("hash")
+var base64 = import("base64")
+var t = import("harness").Tester("dkim")
+
+var kp = crypto.rsagenerate(2048)
+var priv = kp["private"]
+var pub = kp["public"]
+
+var build = Function(subject, text):
+    return msg.MailBuilder().from_("alice@example.com", "Alice Example").to("bob@example.org", "Bob").cc("carol@example.net").subject(subject).text(text).build()
+
+var raw = build("Monthly report", "Hello Bob,\nHere is the report.\n\nRegards,\nAlice\n")
+var signed = dkim.sign(raw, "example.com", "sel1", priv)
+t.check("DKIM-Signature prepended", signed.find("DKIM-Signature: v=1;") == 0)
+t.check("declares rsa-sha256", signed.find("a=rsa-sha256") > 0)
+t.check("declares d= / s=", signed.find("d=example.com") > 0 and signed.find("s=sel1") > 0)
+t.check("has bh= and b=", signed.find("bh=") > 0 and signed.find("; b=") > 0)
+t.check("verify valid signature", dkim.verify(signed, pub))
+
+# tamper detection
+t.check("tamper To -> invalid", not dkim.verify(signed.replace("bob@example.org", "evil@example.org"), pub))
+t.check("tamper Subject -> invalid", not dkim.verify(signed.replace("Monthly report", "Phish report"), pub))
+t.check("tamper body -> invalid", not dkim.verify(signed.replace("Here is the report", "Here is the malware"), pub))
+t.check("wrong key -> invalid", not dkim.verify(signed, crypto.rsagenerate(2048)["public"]))
+t.check("unsigned message -> not verified", not dkim.verify(raw, pub))
+
+# all canonicalization combinations round-trip
+for hc in ["relaxed", "simple"]:
+    for bc in ["relaxed", "simple"]:
+        t.check("round-trip " + hc + "/" + bc, dkim.verify(dkim.sign(raw, "example.com", "s", priv, None, hc, bc), pub))
+
+# custom signed-header list
+var s2 = dkim.sign(raw, "example.com", "s", priv, ["from", "subject"])
+t.check("custom header list verifies", dkim.verify(s2, pub))
+t.check("h= lists chosen headers", s2.find("h=from:subject;") > 0)
+
+# fixed timestamp honored
+t.check("fixed t=", dkim.sign(raw, "example.com", "s", priv, None, "relaxed", "relaxed", 1700000000).find("t=1700000000") > 0)
+
+# facade wiring
+var smtp = import("smtp")
+t.check("facade dkim_sign/dkim_verify", smtp.dkim_verify(smtp.dkim_sign(raw, "example.com", "fac", priv), pub))
+
+# empty body
+var eb = msg.MailBuilder().from_("a@example.com").to("b@example.org").subject("no body").build()
+t.check("empty-body sign/verify", dkim.verify(dkim.sign(eb, "example.com", "s", priv), pub))
+
+# body hash equals an independent sha256 of the canonical body ("PING" -> relaxed "PING\r\n")
+var signed2 = dkim.sign(msg.MailBuilder().from_("a@example.com").to("b@example.org").subject("x").text("PING").build(), "example.com", "s", priv)
+var bh0 = signed2.find("bh=") + 3
+var bh = signed2[bh0:signed2.find(";", bh0)]
+t.check("bh = base64(sha256(canonical body))", bh == base64.encode(fromhex(hash.sha256("PING\r\n"))))
+
+t.done()
