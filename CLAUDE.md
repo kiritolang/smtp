@@ -105,6 +105,8 @@ server-side TLS is client-only (plaintext server), SASL `-PLUS` channel binding 
 and `dkim_verify` takes the key explicitly (`net` has no DNS TXT). Documented in `README.md`.
 
 Interpreter floor: **ki >= 1.13.0** for the socket TLS the client needs; **ki >= 1.14.1** for DKIM.
+Verified green through **ki 1.16.1** (the current release; tag `1.16.1f`) — the whole suite passes
+unchanged, with no analyzer warnings.
 
 ## Keep this file current
 

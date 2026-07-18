@@ -25,9 +25,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # latest, the DKIM-capable floor (1.14.1 = crypto), and the TLS floor (1.13.0 = socket TLS,
-        # no crypto -> the DKIM tests self-skip there).
-        ki: ["latest", "1.14.1", "1.13.0"]
+        # latest, the current pinned stable (1.16.1f, reports "1.16.1"), the DKIM-capable floor
+        # (1.14.1 = crypto), and the TLS floor (1.13.0 = socket TLS, no crypto -> DKIM tests self-skip).
+        ki: ["latest", "1.16.1f", "1.14.1", "1.13.0"]
     steps:
       - uses: actions/checkout@v4
 
