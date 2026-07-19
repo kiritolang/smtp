@@ -105,8 +105,10 @@ server-side TLS is client-only (plaintext server), SASL `-PLUS` channel binding 
 and `dkim_verify` takes the key explicitly (`net` has no DNS TXT). Documented in `README.md`.
 
 Interpreter floor: **ki >= 1.13.0** for the socket TLS the client needs; **ki >= 1.14.1** for DKIM.
-Verified green through **ki 1.16.1** (the current release; tag `1.16.1f`) — the whole suite passes
-unchanged, with no analyzer warnings.
+Verified green through **ki 1.17.0** (the current release) — the whole suite passes unchanged, with no
+analyzer warnings. 1.17.0 reworked `isinstance` and made class names module-qualified (`module:Class`);
+the library leans on both (`isinstance(x, String/Bytes)` and the cross-module typed
+`catch smtp.errors.SmtpError` family), and all of it still resolves.
 
 ## Keep this file current
 
