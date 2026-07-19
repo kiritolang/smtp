@@ -49,8 +49,8 @@ smtp.send(msg, "smtp.example.com", username = "me@example.com", password = "app-
 - **ki ≥ 1.14.1** for **DKIM signing** (needs the `crypto` module — `import("crypto").enabled`). The
   rest of the library works on 1.13.0.
 
-Verified against ki **1.13.0 through 1.16.1** (the current release); the nightly runs the full suite on
-`latest` plus pinned `1.16.1f` / `1.14.1` / `1.13.0`.
+Verified against ki **1.13.0 through 1.17.0** (the current release); the nightly runs the full suite on
+`latest` plus pinned `1.17.0` / `1.14.1` / `1.13.0`.
 
 ## Install
 
